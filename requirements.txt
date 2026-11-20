@@ -1,0 +1,20 @@
+# 版本鎖定成開發機（Python 3.10）目前已安裝、測試通過的版本。
+# 新電腦安裝：python -m venv .venv  →  .venv\Scripts\activate  →  pip install -r requirements.txt
+
+# 網站與轉發
+fastapi==0.115.12
+starlette==0.46.2
+uvicorn==0.34.2
+httpx==0.28.1
+anyio==4.13.0
+pydantic==2.10.6
+
+# 資料庫（asyncpg = PostgreSQL，aiosqlite = SQLite 開發／測試用）
+SQLAlchemy==2.0.48
+greenlet==3.3.2
+asyncpg==0.30.0
+aiosqlite==0.20.0
+
+# 測試
+pytest==8.4.2
+pytest-asyncio==0.25.3

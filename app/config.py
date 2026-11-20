@@ -1,0 +1,263 @@
+"""設定：全部集中在專案根目錄的 config.ini（範本是 config.example.ini）。
+
+格式是 INI：[區段] 底下寫「名稱 = 值」，# 開頭的整行是註解。值留空 = 用預設值。
+名稱或區段打錯字會在啟動時直接報錯，不會被默默忽略（例如把 receive_address 打成 recieve_address）。
+上游與模型只存在這個檔案裡，不進資料庫：改完要重啟伺服器才生效。
+"""
+
+import configparser
+import re
+from functools import lru_cache
+from pathlib import Path
+from typing import Literal
+
+import httpx
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+
+from app.billing import usd_to_micro
+
+ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+CONFIG_PATH = Path("config.ini")
+
+
+class ConfigError(Exception):
+    """設定檔有問題。訊息會指出是哪個區段的哪個名稱。"""
+
+
+class TokenConfig(BaseModel):
+    """[token:USDT] 這類區段：收哪個代幣。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    symbol: str
+    contract: str  # 合約地址，存成小寫
+    decimals: int = Field(default=18, ge=0, le=36)  # BSC 上的 USDT/USDC 是 18
+
+    @field_validator("contract")
+    @classmethod
+    def _check_contract(cls, value: str) -> str:
+        if not ADDRESS_RE.match(value):
+            raise ValueError("合約地址格式錯誤（應該是 0x 開頭、後面接 40 個 0-9 或 a-f）")
+        return value.lower()
+
+
+class UpstreamConfig(BaseModel):
+    """[upstream:名稱] 區段：一個 OpenAI 相容的上游。"""
+
+    name: str
+    base_url: str  # 例：https://api.deepseek.com/v1
+    api_key: str = ""  # 不需要 key 的本機上游可以留空
+
+    @field_validator("base_url")
+    @classmethod
+    def _check_url(cls, value: str) -> str:
+        if not value.startswith(("http://", "https://")):
+            raise ValueError("必須以 http:// 或 https:// 開頭")
+        try:
+            # 例如 port 寫成文字：要在啟動時擋下。等到有人呼叫才失敗的話，預扣已經扣下去了
+            httpx.URL(value)
+        except httpx.InvalidURL as exc:
+            raise ValueError(f"網址格式錯誤：{exc}") from None
+        return value
+
+
+class ModelConfig(BaseModel):
+    """[model:名稱] 區段：對外開放的模型與售價。沒列在設定檔裡的模型一律拒絕。"""
+
+    name: str  # 使用者在工具裡選的模型名稱
+    upstream: str  # 對應哪個 [upstream:名稱]
+    upstream_model: str  # 上游實際的模型名稱
+    input_price_micro: int = Field(ge=0)  # 每 1M 輸入 token 幾 micro-USD
+    output_price_micro: int = Field(ge=0)  # 每 1M 輸出 token 幾 micro-USD
+    max_output_tokens: int = Field(default=4096, gt=0)  # 必須是正數：負數會讓預扣變成「先送額度」
+    max_tokens_field: Literal["max_tokens", "max_completion_tokens"] = "max_tokens"
+    # 一張圖片在這個模型「最多」算幾個輸入 token；0 = 不接受圖片。各家算法差很多，要查上游文件填
+    image_tokens: int = Field(default=0, ge=0)
+
+
+class Settings(BaseModel):
+    database_url: str = "sqlite+aiosqlite:///./dev.db"
+    invite_code: str = ""  # 註冊用邀請碼；留空 = 關閉註冊
+    session_ttl_hours: int = 24 * 7
+    max_body_bytes: int = 1_000_000  # 單一請求內容上限，也間接限制了預扣金額
+    max_concurrent_per_user: int = 4
+    max_keys_per_user: int = 20
+    upstream_timeout_seconds: float = 300
+
+    # ---- 鏈上儲值（方案 B：單一收款地址 + 金額尾數）----
+    chain_name: str = "bsc-testnet"
+    chain_rpc_url: str = ""
+    chain_confirmations: int = 15
+    chain_poll_seconds: float = 10
+    chain_max_block_range: int = 500
+    chain_start_block: int | None = None  # 第一次啟動從哪個區塊開始掃；留空 = 從當下開始
+    receive_address: str = ""  # 你自己錢包的收款地址（只需要地址，不需要私鑰）
+    tokens: dict[str, TokenConfig] = {}
+    deposit_ttl_minutes: int = 30
+    deposit_grace_minutes: int = 30  # 訂單過期後再多等多久才真的作廢（給晚到的轉帳）
+    deposit_min_usd: int = 1
+    deposit_max_usd: int = 1000
+    max_pending_deposits: int = 3
+
+    # ---- 上游與模型 ----
+    upstreams: dict[str, UpstreamConfig] = {}
+    models: dict[str, ModelConfig] = {}
+
+    @model_validator(mode="after")
+    def _check_model_upstreams(self) -> "Settings":
+        for model in self.models.values():
+            if model.upstream not in self.upstreams:
+                raise ValueError(f"模型 {model.name} 指定的上游 {model.upstream} 不存在"
+                                 f"（要有一個 [upstream:{model.upstream}] 區段）")
+        return self
+
+    @property
+    def chain_enabled(self) -> bool:
+        return bool(self.chain_rpc_url and self.receive_address and self.tokens)
+
+    def token_configs(self) -> dict[str, TokenConfig]:
+        return self.tokens
+
+
+# ---------------------------------------------------------------- 讀取 config.ini
+
+# [區段] 裡的名稱 → Settings 的欄位
+_SECTION_FIELDS = {
+    "site": {
+        "database_url": "database_url",
+        "invite_code": "invite_code",
+        "session_ttl_hours": "session_ttl_hours",
+        "max_body_bytes": "max_body_bytes",
+        "max_concurrent_per_user": "max_concurrent_per_user",
+        "max_keys_per_user": "max_keys_per_user",
+        "upstream_timeout_seconds": "upstream_timeout_seconds",
+    },
+    "chain": {
+        "name": "chain_name",
+        "rpc_url": "chain_rpc_url",
+        "receive_address": "receive_address",
+        "confirmations": "chain_confirmations",
+        "poll_seconds": "chain_poll_seconds",
+        "max_block_range": "chain_max_block_range",
+        "start_block": "chain_start_block",
+    },
+    "deposit": {
+        "ttl_minutes": "deposit_ttl_minutes",
+        "grace_minutes": "deposit_grace_minutes",
+        "min_usd": "deposit_min_usd",
+        "max_usd": "deposit_max_usd",
+        "max_pending": "max_pending_deposits",
+    },
+}
+_FIELD_TO_KEY = {field: (section, key) for section, keys in _SECTION_FIELDS.items() for key, field in keys.items()}
+_TOKEN_KEYS = {"contract", "decimals"}
+_UPSTREAM_KEYS = {"base_url", "api_key"}
+_MODEL_KEYS = {"upstream", "upstream_model", "input_price", "output_price", "max_output_tokens",
+               "max_tokens_field", "image_tokens"}
+_MODEL_KEY_NAMES = {"input_price_micro": "input_price", "output_price_micro": "output_price"}
+
+
+def _error_text(error: dict) -> str:
+    """把 pydantic 的英文錯誤換成中文。"""
+    kind, ctx = error["type"], error.get("ctx", {})
+    if kind == "missing":
+        return "必填"
+    if kind == "value_error":
+        return str(ctx.get("error", error["msg"]))
+    if kind in ("int_parsing", "int_from_float"):
+        return "必須是整數"
+    if kind == "float_parsing":
+        return "必須是數字"
+    if kind == "greater_than":
+        return f"必須大於 {ctx['gt']}"
+    if kind == "greater_than_equal":
+        return f"不可小於 {ctx['ge']}"
+    if kind == "less_than_equal":
+        return f"不可大於 {ctx['le']}"
+    if kind == "literal_error":
+        return f"只能是 {ctx['expected']}"
+    return error["msg"]
+
+
+def _read_section(parser: configparser.ConfigParser, section: str, allowed, source: str) -> dict[str, str]:
+    values = {}
+    for key, value in parser[section].items():
+        if key not in allowed:
+            raise ConfigError(f"{source} [{section}] 不認得的名稱：{key}（是不是打錯字？）")
+        value = value.strip()
+        if value:  # 留空 = 用預設值
+            values[key] = value
+    return values
+
+
+def _build(cls, section: str, source: str, key_names: dict | None = None, **values):
+    try:
+        return cls(**values)
+    except ValidationError as exc:
+        error = exc.errors()[0]
+        field = str(error["loc"][0]) if error["loc"] else ""
+        key = (key_names or {}).get(field, field)
+        raise ConfigError(f"{source} [{section}] {key}：{_error_text(error)}") from None
+
+
+def parse_config(parser: configparser.ConfigParser, source: str = "config.ini") -> Settings:
+    if parser.defaults():
+        raise ConfigError(f"{source} 不支援 [DEFAULT] 區段")
+    fields: dict = {}
+    tokens: dict[str, TokenConfig] = {}
+    upstreams: dict[str, UpstreamConfig] = {}
+    models: dict[str, ModelConfig] = {}
+
+    for section in parser.sections():
+        kind, colon, name = (part.strip() for part in section.partition(":"))
+        if not colon and kind in _SECTION_FIELDS:
+            for key, value in _read_section(parser, section, _SECTION_FIELDS[kind], source).items():
+                fields[_SECTION_FIELDS[kind][key]] = value
+        elif colon and name and kind == "token":
+            values = _read_section(parser, section, _TOKEN_KEYS, source)
+            tokens[name.upper()] = _build(TokenConfig, section, source, symbol=name.upper(), **values)
+        elif colon and name and kind == "upstream":
+            values = _read_section(parser, section, _UPSTREAM_KEYS, source)
+            upstreams[name] = _build(UpstreamConfig, section, source, name=name, **values)
+        elif colon and name and kind == "model":
+            values = _read_section(parser, section, _MODEL_KEYS, source)
+            for key in ("input_price", "output_price"):
+                if key in values:
+                    try:
+                        values[f"{key}_micro"] = usd_to_micro(values.pop(key))
+                    except ValueError as exc:
+                        raise ConfigError(f"{source} [{section}] {key}：{exc}") from None
+            values.setdefault("upstream_model", name)
+            models[name] = _build(ModelConfig, section, source, _MODEL_KEY_NAMES, name=name, **values)
+        else:
+            raise ConfigError(f"{source} 不認得的區段：[{section}]")
+
+    try:
+        return Settings(**fields, tokens=tokens, upstreams=upstreams, models=models)
+    except ValidationError as exc:
+        error = exc.errors()[0]
+        field = str(error["loc"][0]) if error["loc"] else ""
+        if field in _FIELD_TO_KEY:
+            section, key = _FIELD_TO_KEY[field]
+            raise ConfigError(f"{source} [{section}] {key}：{_error_text(error)}") from None
+        raise ConfigError(f"{source}：{_error_text(error)}") from None
+
+
+def load_settings(path: Path = CONFIG_PATH) -> Settings:
+    if not path.exists():
+        raise ConfigError(f"找不到設定檔 {path}：請把 config.example.ini 複製成 config.ini 再填值")
+    try:
+        text = path.read_text(encoding="utf-8-sig")  # utf-8-sig：Windows 記事本存檔時加的 BOM 也能讀
+    except UnicodeDecodeError:
+        raise ConfigError(f"{path} 不是 UTF-8 編碼：請用 UTF-8 重新存檔") from None
+    parser = configparser.ConfigParser(interpolation=None)  # 不把 % 當特殊符號：上游 key 裡可能有 %
+    try:
+        parser.read_string(text, source=str(path))
+    except configparser.Error as exc:
+        raise ConfigError(f"{path} 格式錯誤：{exc}") from None
+    return parse_config(parser, str(path))
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return load_settings()

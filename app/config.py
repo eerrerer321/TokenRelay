@@ -6,6 +6,7 @@
 """
 
 import configparser
+import json
 import re
 from functools import lru_cache
 from pathlib import Path
@@ -41,6 +42,13 @@ class TokenConfig(BaseModel):
         return value.lower()
 
 
+HEADER_NAME_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")  # HTTP 標頭名稱允許的字元
+HEADER_VALUE_RE = re.compile(r"^[\x20-\x7e]*$")  # 只收可見的 ASCII：中文或換行要等到送出時才失敗，那時已經預扣了
+# 站方自己會設定的標頭：驗證、內容格式、連線控制。讓設定檔蓋掉的話，上游 key 可能送錯地方或請求格式壞掉
+RESERVED_HEADERS = frozenset({"authorization", "x-api-key", "anthropic-version", "content-type", "content-length",
+                              "host", "transfer-encoding", "connection"})
+
+
 class UpstreamConfig(BaseModel):
     """[upstream:名稱] 區段：一個 OpenAI 相容的上游。"""
 
@@ -50,6 +58,52 @@ class UpstreamConfig(BaseModel):
     responses: bool = False  # 上游有 OpenAI 的 /responses（Codex CLI 用）才開
     # 上游的 Anthropic 格式入口（Claude Code 用的 /v1/messages），例如 https://api.deepseek.com/anthropic；留空 = 不支援
     anthropic_base_url: str = ""
+    # Anthropic 入口怎麼帶 key：x-api-key（Anthropic 官方）或 bearer（Authorization: Bearer，例如 opencode Go）
+    anthropic_auth: Literal["x-api-key", "bearer"] = "x-api-key"
+    # 每個請求固定附加的標頭，設定檔裡寫成一行 JSON，例如 {"User-Agent": "my-relay/1.0"}
+    headers: dict[str, str] = {}
+    # 上游要「對話 ID」時填標頭名稱（例如 opencode Go 的 x-opencode-session）；留空 = 不送
+    session_header: str = ""
+
+    @field_validator("headers", mode="before")
+    @classmethod
+    def _parse_headers(cls, value):
+        if not isinstance(value, str):
+            return value
+        try:
+            value = json.loads(value)
+        except ValueError:
+            raise ValueError('要寫成一行 JSON，例如 {"User-Agent": "my-relay/1.0"}') from None
+        if not isinstance(value, dict) or not all(isinstance(v, str) for v in value.values()):
+            raise ValueError('要寫成一行 JSON，名稱和值都是字串，例如 {"User-Agent": "my-relay/1.0"}')
+        return value
+
+    @field_validator("headers")
+    @classmethod
+    def _check_headers(cls, value: dict[str, str]) -> dict[str, str]:
+        for name, header_value in value.items():
+            if not HEADER_NAME_RE.match(name):
+                raise ValueError(f"標頭名稱格式錯誤：{name!r}")
+            if name.lower() in RESERVED_HEADERS:
+                raise ValueError(f"{name} 由站方自己設定，不能在這裡改")
+            if not HEADER_VALUE_RE.match(header_value):
+                raise ValueError(f"標頭 {name} 的值只能是英數字和一般符號（不能有中文或換行）")
+        return value
+
+    @field_validator("session_header")
+    @classmethod
+    def _check_session_header(cls, value: str) -> str:
+        if value and not HEADER_NAME_RE.match(value):
+            raise ValueError(f"標頭名稱格式錯誤：{value!r}")
+        if value.lower() in RESERVED_HEADERS:
+            raise ValueError(f"{value} 由站方自己設定，不能當對話 ID 的標頭")
+        return value
+
+    @model_validator(mode="after")
+    def _check_session_not_in_headers(self) -> "UpstreamConfig":
+        if self.session_header and self.session_header.lower() in {name.lower() for name in self.headers}:
+            raise ValueError(f"headers 裡不能再寫 {self.session_header}（它是 session_header，每個請求會自動產生）")
+        return self
 
     @field_validator("base_url", "anthropic_base_url")
     @classmethod
@@ -211,7 +265,8 @@ _SECTION_FIELDS = {
 }
 _FIELD_TO_KEY = {field: (section, key) for section, keys in _SECTION_FIELDS.items() for key, field in keys.items()}
 _TOKEN_KEYS = {"contract", "decimals"}
-_UPSTREAM_KEYS = {"base_url", "api_key", "responses", "anthropic_base_url"}
+_UPSTREAM_KEYS = {"base_url", "api_key", "responses", "anthropic_base_url", "anthropic_auth", "headers",
+                  "session_header"}
 _PRICE_KEYS = ("input_price", "output_price", "cached_input_price", "image_price",
                "cost_input_price", "cost_output_price", "cost_cached_input_price")
 _MODEL_KEYS = {"upstream", "upstream_model", *_PRICE_KEYS, "max_output_tokens", "max_tokens_field", "image_tokens",

@@ -22,6 +22,8 @@
   <ul class="nav nav-tabs mb-3" role="tablist">
     <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#tab-overview"
                                  type="button" role="tab">總覽</button></li>
+    <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-revenue"
+                                 type="button" role="tab">收益試算</button></li>
     <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-models"
                                  type="button" role="tab">模型與價格</button></li>
     <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-users"
@@ -61,6 +63,50 @@
           </table>
           <div class="small text-body-secondary mt-2">BNB 是手續費（gas）：要把 USDT/USDC 轉出去，錢包裡得留一點 BNB。</div>
         </div>
+      </div>
+    </section>
+
+    <!-- ============================================================ 收益試算 -->
+    <section class="tab-pane fade" id="tab-revenue" role="tabpanel">
+      <div class="d-flex flex-wrap gap-2 justify-content-between align-items-center mb-2">
+        <div class="btn-group btn-group-sm" role="group" aria-label="期間" id="revenue-periods"></div>
+        <button class="btn btn-sm btn-outline-secondary" id="revenue-refresh" type="button">重新整理</button>
+      </div>
+      <div class="row g-3 mb-3">
+        <div class="col-6 col-lg-3"><div class="card h-100"><div class="card-body">
+          <div class="small text-body-secondary">向使用者收（美元）</div><div class="fs-4" id="rev-revenue">-</div>
+          <div class="small text-body-secondary" id="rev-requests"></div>
+        </div></div></div>
+        <div class="col-6 col-lg-3"><div class="card h-100"><div class="card-body">
+          <div class="small text-body-secondary">上游花費（美元）</div><div class="fs-4" id="rev-cost">-</div>
+          <div class="small text-body-secondary" id="rev-allowance"></div>
+        </div></div></div>
+        <div class="col-6 col-lg-3"><div class="card h-100"><div class="card-body">
+          <div class="small text-body-secondary">毛利（美元）</div><div class="fs-4" id="rev-profit">-</div>
+          <div class="small text-body-secondary">只算知道上游花多少的請求</div>
+        </div></div></div>
+        <div class="col-6 col-lg-3"><div class="card h-100"><div class="card-body">
+          <div class="small text-body-secondary">上游花費不知道</div><div class="fs-4" id="rev-unknown">-</div>
+          <div class="small text-body-secondary" id="rev-unknown-revenue"></div>
+        </div></div></div>
+      </div>
+      <div class="table-responsive">
+        <table class="table table-sm align-middle">
+          <thead>
+            <tr>
+              <th>上游</th><th>模型</th><th class="text-end">請求數</th><th class="text-end">向使用者收</th>
+              <th class="text-end">上游花費</th><th class="text-end">毛利</th><th class="text-end">Go 方案額度</th>
+              <th class="text-end">估算／不知道</th>
+            </tr>
+          </thead>
+          <tbody id="revenue-list"></tbody>
+        </table>
+      </div>
+      <div class="small text-body-secondary">
+        上游花費：上游有回報實際花費（opencode、OpenRouter）就用回報值；沒有就用模型的「進價」× token 數估算（算進「估算」筆數）；
+        進價沒填、按張數計費的圖片，或上游沒回用量（中途斷線等）就算「不知道」。
+        opencode Go 額度內的請求實際花費是 0，用掉的方案額度另外列在「Go 方案額度」。
+        只統計升級到這個版本之後的紀錄。
       </div>
     </section>
 

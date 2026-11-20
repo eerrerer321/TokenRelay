@@ -205,6 +205,20 @@ async def test_responses_and_messages_hold_extra_for_tools(h):
                                      [{"name": "f", "input_schema": {"type": "object"}}]) >= margin
 
 
+async def test_responses_and_messages_hide_upstream_cost(h):
+    """Responses 串流的用量包在 response 裡、Anthropic 串流開頭包在 message 裡，也都要拿掉上游成本。"""
+    key = await setup_user(h)
+    h.upstream.usage_extra = {"cost": 0.00412, "opencode": {"allowance": 0.00412}}
+    cases = [("/v1/responses", {"model": "gpt-test", "input": "hi"}), ("/v1/messages", claude_body())]
+    for path, body in cases:
+        for stream in (False, True):
+            r = await post(h, path, key, {**body, "stream": stream})
+            assert r.status_code == 200, r.text
+            assert "cost" not in r.text and "allowance" not in r.text, (path, stream, r.text)
+            assert "input_tokens" in r.text
+            assert (await last_usage(h)).status == "ok"
+
+
 async def test_responses_needs_upstream_support(h):
     key = await setup_user(h, upstream="plain")  # plain 上游沒設 responses = true
     r = await post(h, "/v1/responses", key, {"model": "gpt-test", "input": "hi"})

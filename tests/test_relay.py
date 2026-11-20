@@ -11,7 +11,7 @@ from sqlalchemy import select
 
 from app import relay
 from app.billing import TOOLS_MARGIN_TOKENS, HoldRejected, calc_cost, estimate_hold, place_hold
-from app.config import ModelConfig
+from app.config import ModelConfig, UpstreamConfig
 from app.main import create_app
 from app.models import ApiKey, UsageLog
 from app.relay import encode_upstream_body, prepare_upstream_body
@@ -487,6 +487,100 @@ async def test_disconnect_closes_upstream_stream_that_is_still_producing(h):
     assert h.upstream.stream_closed is True
     assert (await last_usage(h)).status == "interrupted"
     assert await h.balance() == CREDIT - expected_hold(raw)
+
+
+# ---------------------------------------------------------------- 上游要求的標頭（例如 opencode Go）
+
+
+def use_upstream(h, **extra) -> None:
+    """等同在 config.ini 的 [upstream:fake] 多寫幾個設定。"""
+    h.app.state.settings.upstreams["fake"] = UpstreamConfig(
+        name="fake", base_url="http://upstream/v1", api_key=UPSTREAM_SECRET, responses=True,
+        anthropic_base_url="http://upstream/anthropic", **extra)
+
+
+async def sent_headers(h, key: str, **client_headers) -> dict:
+    r = await h.client.post("/v1/chat/completions", content=chat_body(),
+                            headers={**auth(key), "Content-Type": "application/json", **client_headers})
+    assert r.status_code == 200, r.text
+    return h.upstream.requests[-1]["headers"]
+
+
+async def test_upstream_fixed_headers_are_sent_but_cannot_replace_auth(h):
+    key = await setup_user(h)
+    use_upstream(h, headers={"User-Agent": "my-relay/1.0", "X-Title": "relay"})
+    sent = await sent_headers(h, key)
+    assert sent["user-agent"] == "my-relay/1.0" and sent["x-title"] == "relay"
+    assert sent["authorization"] == f"Bearer {UPSTREAM_SECRET}"
+    assert "x-opencode-session" not in sent  # 沒設 session_header 就不送
+
+
+async def test_upstream_session_id_is_stable_per_key_and_isolated_between_users(h):
+    use_upstream(h, session_header="x-opencode-session")
+    await h.add_model()
+    alice_session, alice = await h.user_with_key(credit_micro=CREDIT)
+    alice2 = await h.create_key(alice_session)  # 同一個使用者的第二把 key
+    _, bob = await h.user_with_key("bob@example.com", credit_micro=CREDIT)
+
+    def sid(headers):
+        return headers["x-opencode-session"]
+
+    # 工具沒帶：每把 key 一個固定值，不同 key 不同
+    first = sid(await sent_headers(h, alice))
+    assert first.startswith("ses_") and first == sid(await sent_headers(h, alice))
+    assert first != sid(await sent_headers(h, alice2)) != sid(await sent_headers(h, bob))
+    # 工具有帶：同一個使用者同一段對話固定；別的使用者送一樣的值也不會撞在一起；原始值不會送到上游
+    mine = sid(await sent_headers(h, alice, **{"x-opencode-session": "conv-1"}))
+    assert mine == sid(await sent_headers(h, alice2, **{"x-opencode-session": "conv-1"}))
+    assert mine not in (first, sid(await sent_headers(h, bob, **{"x-opencode-session": "conv-1"})))
+    assert mine != sid(await sent_headers(h, alice, **{"x-opencode-session": "conv-2"}))
+    assert all("conv-1" not in str(r["headers"]) for r in h.upstream.requests)
+
+
+@pytest.mark.parametrize("style", ["x-api-key", "bearer"])
+async def test_anthropic_upstream_auth_style(h, style):
+    key = await setup_user(h)
+    use_upstream(h, anthropic_auth=style)
+    r = await h.client.post("/v1/messages", headers={"x-api-key": key}, json={
+        "model": "gpt-test", "max_tokens": 50, "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 200, r.text
+    sent = h.upstream.requests[-1]["headers"]
+    if style == "bearer":
+        assert sent["authorization"] == f"Bearer {UPSTREAM_SECRET}" and "x-api-key" not in sent
+    else:
+        assert sent["x-api-key"] == UPSTREAM_SECRET and "authorization" not in sent
+    assert sent["anthropic-version"] == "2023-06-01"
+
+
+# opencode 文件的用量格式：cost 是扣站方餘額的美元，opencode 裡有進價與用掉多少方案額度
+UPSTREAM_COST = {"cost": 0.00412, "cost_details": {"upstream_inference_cost": 0.004},
+                 "opencode": {"billing_source": "go", "list_cost": 0.00412, "allowance": 0.00412}}
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_upstream_cost_is_not_shown_to_users(h, stream):
+    """上游在用量裡附上的成本是站方的進價：不轉給使用者，但照常按 token 計費。"""
+    key = await setup_user(h)
+    h.upstream.usage_extra = UPSTREAM_COST
+    r = await post_chat(h, key, chat_body(stream=stream))
+    assert r.status_code == 200
+    for name in ("cost", "opencode", "allowance", "0.00412"):
+        assert name not in r.text, name
+    assert "prompt_tokens" in r.text  # 用量本身照常回給使用者
+    usage = await last_usage(h)
+    assert usage.cost_micro == ACTUAL_COST
+    # 拿掉的成本記進用量紀錄，給後台的收益試算用（0.00412 美元 = 4120 micro）
+    assert (usage.upstream, usage.upstream_cost_micro, usage.upstream_cost_estimated,
+            usage.upstream_allowance_micro) == ("fake", 4120, False, 4120)
+
+
+@pytest.mark.parametrize("value, expected", [
+    (0.00412, 4120), (0, 0), (0.0000011, 2),  # 比 micro 更小的部分無條件進位
+    (True, None), ("0.1", None), (-1, None), (float("nan"), None), (float("inf"), None), (10**7, None),
+])
+def test_reported_upstream_cost_is_validated(value, expected):
+    """上游回報的花費只是記錄用，但亂七八糟的數字（字串、負數、NaN、天文數字）要當作沒回報。"""
+    assert relay.reported_usd_to_micro(value) == expected
 
 
 # ---------------------------------------------------------------- 上游出錯

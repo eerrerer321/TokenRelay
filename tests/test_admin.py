@@ -1,9 +1,16 @@
 """站長後台：只限本機、改 config.ini（保留註解）並立即生效、錢包餘額、重設密碼連結。"""
 
+from datetime import datetime, timedelta
+
 import httpx
 import pytest
+from sqlalchemy import delete, select
 
+from app.admin import _money, revenue_periods
+from app.billing import format_usd
 from app.config import ConfigError
+from app.db import utcnow
+from app.models import UsageLog
 from app.config_edit import add_section, remove_section, set_values
 from app.main import create_app
 from tests.conftest import INVITE, RECEIVE, USDT, USDC, auth
@@ -234,6 +241,80 @@ async def test_upstream_model_list_converts_prices_per_million(ah):
          "cost_cached_input_price": "0.300000"},
     ]
     assert ah.upstream.requests[-1]["headers"]["authorization"] == f"Bearer {UPSTREAM_SECRET}"
+
+
+# ---------------------------------------------------------------- 收益試算
+
+
+async def usage_rows(ah) -> list[UsageLog]:
+    async with ah.app.state.sessionmaker() as s:
+        return list((await s.execute(select(UsageLog).order_by(UsageLog.id))).scalars())
+
+
+async def test_revenue_splits_reported_estimated_and_unknown_upstream_cost(ah):
+    """假上游回 10 輸入 + 20 輸出 tokens；售價 1、2 美元 / 100 萬 tokens → 每次向使用者收 50 micro。"""
+    token, key, _ = await setup_friend(ah)
+    # 1. 上游有回報花費（opencode：額度內實際花費、用掉的方案額度）→ 用回報值
+    ah.upstream.usage_extra = {"cost": 0.00003, "opencode": {"allowance": 0.00004}}
+    assert (await chat(ah, key)).status_code == 200
+    # 2. 沒回報、模型也沒填進價 → 不知道
+    ah.upstream.usage_extra = {}
+    assert (await chat(ah, key)).status_code == 200
+    # 3. 沒回報、有填進價 → 用進價估算（含快取命中）：6 × 0.5 + 4 × 0.1 + 20 × 1 = 23.4 → 進位 24
+    assert (await ah.put_model("gpt-test", cost_input_price="0.5", cost_output_price="1",
+                               cost_cached_input_price="0.1")).status_code == 200
+    ah.upstream.usage_extra = {"prompt_tokens_details": {"cached_tokens": 4}}
+    assert (await chat(ah, key)).status_code == 200
+    # 4. 上游沒給用量 → 收全額預扣，上游花多少不知道（不能當成全賺）
+    ah.upstream.mode = "no_usage"
+    assert (await chat(ah, key)).status_code == 200
+    # 5. 上游回錯誤 → 全額退款：沒收錢，所以不算「不知道上游花多少」
+    ah.upstream.mode = "error500"
+    assert (await chat(ah, key)).status_code == 502
+
+    rows = await usage_rows(ah)
+    assert [(r.upstream, r.upstream_cost_micro, r.upstream_cost_estimated, r.upstream_allowance_micro)
+            for r in rows] == [("fake", 30, False, 40), ("fake", None, None, None), ("fake", 24, True, None),
+                               ("fake", None, None, None), ("fake", None, None, None)]
+    assert rows[2].cached_tokens == 4
+    hold = rows[3].cost_micro
+
+    periods = (await ah.client.get("/admin/api/revenue")).json()["periods"]
+    assert [p["code"] for p in periods] == ["today", "7d", "30d"]
+    for period in periods:
+        assert period["rows"] == [{
+            "upstream": "fake", "model": "gpt-test", "requests": 5, "revenue": format_usd(150 + hold),
+            "upstream_cost": format_usd(54), "allowance": format_usd(40), "estimated": 1, "unknown": 2,
+            "unknown_revenue": format_usd(50 + hold), "profit": format_usd(150 - 50 - 54),
+        }]
+        assert period["total"]["profit"] == format_usd(46)
+
+
+async def test_revenue_periods(ah):
+    # 台灣時間 11/20 23:30 → 今天從台灣 11/20 00:00（= UTC 11/19 16:00）算起；過了台灣午夜就換一天
+    assert revenue_periods(datetime(2026, 11, 20, 15, 30))[0][2] == datetime(2026, 11, 19, 16, 0)
+    assert revenue_periods(datetime(2026, 11, 20, 16, 30))[0][2] == datetime(2026, 11, 20, 16, 0)
+
+    _, key, user_id = await setup_friend(ah)
+    assert (await chat(ah, key)).status_code == 200
+    async with ah.app.state.sessionmaker.begin() as s:  # 8 天前的一筆：只算進 30 天
+        key_id = (await s.execute(select(UsageLog.api_key_id))).scalar_one()
+        s.add(UsageLog(user_id=user_id, api_key_id=key_id, model="gpt-test", upstream="fake", stream=False,
+                       hold_micro=1000, cost_micro=1000, upstream_cost_micro=100, upstream_cost_estimated=False,
+                       status="ok", created_at=utcnow() - timedelta(days=8)))
+        s.add(UsageLog(user_id=user_id, api_key_id=key_id, model="gpt-test", upstream="fake", stream=False,
+                       hold_micro=1000, status="pending"))  # 還沒結算的不算
+    totals = {p["code"]: p["total"] for p in (await ah.client.get("/admin/api/revenue")).json()["periods"]}
+    assert totals["7d"]["requests"] == 1 and totals["30d"]["requests"] == 2
+    assert totals["30d"]["revenue"] == format_usd(1050)
+    async with ah.app.state.sessionmaker.begin() as s:  # 讓 conftest 以外的結尾檢查也乾淨：把假的 pending 刪掉
+        await s.execute(delete(UsageLog).where(UsageLog.status == "pending"))
+
+
+def test_negative_profit_is_shown_with_minus_sign():
+    row = {"requests": 1, "revenue": 10, "upstream_cost": 30, "allowance": 0, "estimated": 1, "unknown": 0,
+           "unknown_revenue": 0}
+    assert _money(row)["profit"] == "-0.000020"
 
 
 # ---------------------------------------------------------------- 錢包與使用者

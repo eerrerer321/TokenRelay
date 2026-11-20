@@ -355,9 +355,54 @@ $("credit-form").addEventListener("submit", (event) => {
   });
 });
 
+// ---------------------------------------------------------------- 收益試算
+
+let revenueData = null;
+let revenuePeriod = "today";
+
+/** "-0.500000" 這種負數也要能修剪 */
+function money(value) {
+  const text = String(value);
+  return text.startsWith("-") ? "-" + (trimPrice(text.slice(1)) || "0") : trimPrice(text) || "0";
+}
+
+function renderRevenue() {
+  const period = revenueData.periods.find((p) => p.code === revenuePeriod) || revenueData.periods[0];
+  $("revenue-periods").replaceChildren(...revenueData.periods.map((p) => el("button", {
+    type: "button", class: "btn btn-outline-primary" + (p.code === period.code ? " active" : ""),
+    onclick: () => { revenuePeriod = p.code; renderRevenue(); },
+  }, p.label)));
+  const t = period.total;
+  $("rev-revenue").textContent = money(t.revenue);
+  $("rev-requests").textContent = `${t.requests} 個請求`;
+  $("rev-cost").textContent = money(t.upstream_cost);
+  $("rev-allowance").textContent = t.allowance === "0.000000" ? "" : `另用掉 Go 方案額度 ${money(t.allowance)}`;
+  $("rev-profit").textContent = money(t.profit);
+  $("rev-profit").classList.toggle("text-danger", String(t.profit).startsWith("-"));
+  $("rev-unknown").textContent = `${t.unknown} 筆`;
+  $("rev-unknown-revenue").textContent = t.unknown ? `這些請求收了 ${money(t.unknown_revenue)}，沒算進毛利` : "";
+  const tbody = $("revenue-list");
+  if (!period.rows.length) return emptyRow(tbody, 8, "這段期間沒有請求");
+  const num = (v, extra = "") => el("td", { class: "text-end font-monospace " + extra }, v);
+  tbody.replaceChildren(...period.rows.map((r) => el("tr", {},
+    el("td", {}, r.upstream || "（舊紀錄）"), el("td", {}, r.model),
+    num(r.requests), num(money(r.revenue)), num(money(r.upstream_cost)),
+    num(money(r.profit), String(r.profit).startsWith("-") ? "text-danger" : ""),
+    num(r.allowance === "0.000000" ? "—" : money(r.allowance)),
+    num(`${r.estimated}／${r.unknown}`))));
+}
+
+async function loadRevenue() {
+  revenueData = await api("/admin/api/revenue");
+  renderRevenue();
+}
+
+$("revenue-refresh").addEventListener("click", () => guarded(loadRevenue));
+
 // ---------------------------------------------------------------- 分頁
 
-const LOADERS = { "#tab-overview": loadOverview, "#tab-models": loadModels, "#tab-users": loadUsers };
+const LOADERS = { "#tab-overview": loadOverview, "#tab-revenue": loadRevenue, "#tab-models": loadModels,
+                  "#tab-users": loadUsers };
 for (const button of document.querySelectorAll('[data-bs-toggle="tab"]')) {
   button.addEventListener("shown.bs.tab", () => guarded(LOADERS[button.dataset.bsTarget]));
 }

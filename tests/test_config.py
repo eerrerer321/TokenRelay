@@ -96,6 +96,46 @@ def test_mistakes_are_reported_with_location(tmp_path, text, expected):
     assert expected in str(exc.value)
 
 
+def upstream_with(extra: str) -> str:
+    return UPSTREAM + extra + MODEL
+
+
+def test_upstream_headers_auth_and_session_are_read(tmp_path):
+    settings = load_settings(write(tmp_path, upstream_with(
+        'anthropic_auth = bearer\nheaders = {"User-Agent": "my-relay/1.0", "X-Title": "a b; c=1"}\n'
+        "session_header = x-opencode-session\n")))
+    up = settings.upstreams["up"]
+    assert up.anthropic_auth == "bearer"
+    assert up.headers == {"User-Agent": "my-relay/1.0", "X-Title": "a b; c=1"}
+    assert up.session_header == "x-opencode-session"
+    # 不填 = 跟以前一樣
+    up = load_settings(write(tmp_path, VALID)).upstreams["up"]
+    assert (up.anthropic_auth, up.headers, up.session_header) == ("x-api-key", {}, "")
+
+
+@pytest.mark.parametrize("extra, expected", [
+    ("headers = User-Agent: x\n", "[upstream:up] headers：要寫成一行 JSON"),
+    ('headers = ["User-Agent"]\n', "[upstream:up] headers：要寫成一行 JSON"),
+    ('headers = {"X-Count": 1}\n', "[upstream:up] headers：要寫成一行 JSON"),
+    ('headers = {"Bad Name": "x"}\n', "[upstream:up] headers：標頭名稱格式錯誤"),
+    # 驗證標頭蓋掉的話，站方的上游 key 可能被送錯地方
+    ('headers = {"authorization": "Bearer other"}\n', "[upstream:up] headers：authorization 由站方自己設定"),
+    ('headers = {"X-API-Key": "x"}\n', "[upstream:up] headers：X-API-Key 由站方自己設定"),
+    # 送出時才編碼失敗的話，預扣已經扣下去了，所以讀設定檔時就要擋
+    ('headers = {"User-Agent": "中文"}\n', "[upstream:up] headers：標頭 User-Agent 的值只能是"),
+    ('headers = {"User-Agent": "a\\r\\nX-Evil: 1"}\n', "[upstream:up] headers：標頭 User-Agent 的值只能是"),
+    ("session_header = x session\n", "[upstream:up] session_header：標頭名稱格式錯誤"),
+    ("session_header = Authorization\n", "[upstream:up] session_header：Authorization 由站方自己設定"),
+    ('session_header = x-s\nheaders = {"X-S": "fixed"}\n', "[upstream:up] headers 裡不能再寫 x-s"),
+    ("anthropic_auth = basic\n", "[upstream:up] anthropic_auth：只能是"),
+], ids=["not-json", "json-list", "json-number", "bad-name", "auth-header", "api-key-header", "non-ascii",
+        "crlf", "bad-session-name", "reserved-session", "session-in-headers", "bad-auth-style"])
+def test_upstream_header_mistakes_are_reported(tmp_path, extra, expected):
+    with pytest.raises(ConfigError) as exc:
+        load_settings(write(tmp_path, upstream_with(extra)))
+    assert expected in str(exc.value)
+
+
 def test_missing_file_says_how_to_create_it(tmp_path):
     with pytest.raises(ConfigError, match="config.example.ini"):
         load_settings(tmp_path / "config.ini")

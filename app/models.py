@@ -69,11 +69,17 @@ class UsageLog(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     api_key_id: Mapped[int] = mapped_column(ForeignKey("api_keys.id"))
     model: Mapped[str] = mapped_column(String(100))  # config.ini 裡的 [model:名稱]
+    upstream: Mapped[str] = mapped_column(String(100), default="")  # 當時用的 [upstream:名稱]，給收益試算分上游
     stream: Mapped[bool]
     hold_micro: Mapped[int] = mapped_column(BigInteger)
-    cost_micro: Mapped[int] = mapped_column(BigInteger, default=0)
+    cost_micro: Mapped[int] = mapped_column(BigInteger, default=0)  # 向使用者收了多少
     prompt_tokens: Mapped[int | None]
     completion_tokens: Mapped[int | None]
+    cached_tokens: Mapped[int | None]  # prompt_tokens 裡快取命中的部分
+    # 上游收站方多少錢：上游有回報就是回報值，沒有就用進價（cost_*）× token 數估算；None = 不知道
+    upstream_cost_micro: Mapped[int | None] = mapped_column(BigInteger)
+    upstream_cost_estimated: Mapped[bool | None]  # True = 上面那個數字是估的
+    upstream_allowance_micro: Mapped[int | None] = mapped_column(BigInteger)  # opencode Go 用掉的方案額度
     status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
     upstream_status: Mapped[int | None]
     created_at: Mapped[datetime] = mapped_column(default=utcnow)

@@ -95,7 +95,8 @@ class HoldRejected(Exception):
 
 
 async def place_hold(
-    sm: async_sessionmaker, *, user_id: int, api_key_id: int, model: str, stream: bool, hold: int
+    sm: async_sessionmaker, *, user_id: int, api_key_id: int, model: str, stream: bool, hold: int,
+    upstream: str = "",
 ) -> int:
     """建立 pending 的用量紀錄並預扣，回傳用量紀錄 id。失敗時整個交易撤銷，什麼都沒寫入。
 
@@ -113,7 +114,8 @@ async def place_hold(
         )).scalar_one_or_none()
         if not active:
             raise HoldRejected("key_revoked")
-        usage = UsageLog(user_id=user_id, api_key_id=api_key_id, model=model, stream=stream, hold_micro=hold)
+        usage = UsageLog(user_id=user_id, api_key_id=api_key_id, model=model, upstream=upstream, stream=stream,
+                         hold_micro=hold)
         session.add(usage)
         await session.flush()
         if not await change_balance(session, user_id, -hold, "hold", f"usage:{usage.id}", require_sufficient=True):
@@ -130,8 +132,15 @@ async def settle(
     prompt_tokens: int | None = None,
     completion_tokens: int | None = None,
     upstream_status: int | None = None,
+    cached_tokens: int | None = None,
+    upstream_cost: int | None = None,
+    upstream_cost_estimated: bool | None = None,
+    upstream_allowance: int | None = None,
 ) -> bool:
-    """結算一筆預扣：退回 hold - cost（若實際比預扣還貴，差額照扣）。保證只會結算一次。"""
+    """結算一筆預扣：退回 hold - cost（若實際比預扣還貴，差額照扣）。保證只會結算一次。
+
+    upstream_* 只記下來給收益試算用，不影響向使用者收的錢。
+    """
     async with sm.begin() as session:
         # 先 UPDATE 再讀：status='pending' 條件讓第二次結算改到 0 列，直接結束
         result = await session.execute(
@@ -143,6 +152,10 @@ async def settle(
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 upstream_status=upstream_status,
+                cached_tokens=cached_tokens,
+                upstream_cost_micro=upstream_cost,
+                upstream_cost_estimated=upstream_cost_estimated,
+                upstream_allowance_micro=upstream_allowance,
                 settled_at=utcnow(),
             )
             .execution_options(synchronize_session=False)

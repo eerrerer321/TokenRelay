@@ -161,7 +161,7 @@ class FakeUpstream:
             return error
         start_usage = {"input_tokens": self.prompt_tokens, "output_tokens": 1,
                        "cache_read_input_tokens": self.anthropic_cache_read,
-                       "cache_creation_input_tokens": self.anthropic_cache_write}
+                       "cache_creation_input_tokens": self.anthropic_cache_write, **self.usage_extra}
         message = {"id": "msg_1", "type": "message", "role": "assistant", "model": body.get("model"),
                    "content": [{"type": "text", "text": "Hello"}], "stop_reason": "end_turn"}
         if not body.get("stream"):
@@ -184,7 +184,8 @@ class FakeUpstream:
                 yield event("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn"}})
             elif self.mode != "cut_stream":
                 yield event("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn"},
-                                              "usage": {"output_tokens": self.completion_tokens}})
+                                              "usage": {"output_tokens": self.completion_tokens,
+                                                        **self.usage_extra}})
                 yield event("message_stop", {"type": "message_stop"})
 
         return StreamingResponse(events(), media_type="text/event-stream")

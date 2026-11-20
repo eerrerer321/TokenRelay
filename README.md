@@ -47,6 +47,10 @@ Copy-Item config.example.ini config.ini
 - OpenAI 的新模型要把 `max_tokens_field` 改成 `max_completion_tokens`。
 - 為了避免額外計費，請求參數採白名單制（清單在 [docs/設計.md](docs/設計.md) 5.4）。朋友的工具如果送了白名單外的參數（例如 DeepSeek 的 `thinking`），會收到 400 並看到是哪個參數。確認那個參數不影響計費後，再加進 `app/relay.py` 的白名單。
 - 如果上游是 OpenRouter，它可能因為 `tools`、`response_format` 改選較貴的供應商；售價要抓最貴的那家（見攻防清單 B）。
+- 上游有特別要求時（opencode Go 是一個例子，`config.example.ini` 裡有整段範例）：
+  - `headers`：每個請求固定附加的標頭，寫成一行 JSON，例如 `{"User-Agent": "my-relay/1.0"}`。驗證用的標頭（`Authorization`、`x-api-key` 等）由站方自己設定，不能寫在這裡。
+  - `anthropic_auth = bearer`：上游的 Anthropic 入口要用 `Authorization: Bearer` 帶 key（預設是 Anthropic 官方的 `x-api-key`）。
+  - `session_header`：上游要「對話 ID」時填標頭名稱（例如 `x-opencode-session`）。使用者的工具有帶同名標頭就沿用，但會先混入使用者 ID 再雜湊，不同使用者不會撞在一起，原始值也不會送到上游；沒帶就每把 key 固定一個。Claude Code、Codex 各自的原生對話標頭**不會**轉送。
 - 設定檔打錯字（名稱、區段、數值格式）會在啟動時直接報錯，並指出是哪個區段的哪個名稱。改完設定要重啟伺服器才會生效。
 
 確認設定檔讀得進來、模型和價格正確：
@@ -159,6 +163,9 @@ python -m app.cli assign-transfer --id 轉帳編號 --email 使用者email
 伺服器跑起來之後，在**同一台電腦**開 http://localhost:8000/admin （不用帳密，別台電腦開會是 404）：
 
 - 總覽：使用者餘額合計、近 30 天收入、收款錢包目前的 BNB／USDT／USDC 餘額
+- 收益試算：今天（台灣時間 00:00 起）、過去 7 天、過去 30 天，依上游與模型列出「向使用者收多少、上游花多少、毛利」。
+  上游有回報實際花費（opencode、OpenRouter）就用回報值；沒有就用模型的進價 × token 數估算；進價沒填或上游沒回用量的請求列為「不知道」，不算進毛利。
+  opencode Go 額度內的請求另外列出用掉多少方案額度。這是新增的資料表欄位，**舊的資料庫要刪掉重建**（專案沒有 migration 工具，見攻防清單 P）
 - 模型與價格：開關模型、改售價和快取價、記錄進價並一鍵「售價 = 進價 × 倍數」、從上游載入模型清單（OpenRouter 會附進價）。
   存檔會直接改寫 `config.ini` 的那幾行（註解不動，舊版存成 `config.ini.bak`），不用重啟
 - 使用者：產生重設密碼連結（朋友忘記密碼時私訊給他）、手動調整餘額

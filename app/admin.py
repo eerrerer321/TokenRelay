@@ -10,7 +10,7 @@
 """
 
 import secrets
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from pathlib import Path
 
@@ -18,7 +18,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import and_, case, func, select
 
 from app import config_edit
 from app.accounts import iso_utc
@@ -203,7 +203,9 @@ async def upstream_models(name: str, request: Request):
     upstream = state.settings.upstreams.get(name)
     if upstream is None:
         raise HTTPException(404, "找不到這個上游")
-    headers = {"Authorization": f"Bearer {upstream.api_key}"} if upstream.api_key else {}
+    headers = dict(upstream.headers)  # 例如上游要求的 User-Agent
+    if upstream.api_key:
+        headers["Authorization"] = f"Bearer {upstream.api_key}"
     try:
         resp = await state.http.get(upstream.base_url.rstrip("/") + "/models", headers=headers, timeout=20)
         data = resp.json()
@@ -223,6 +225,63 @@ async def upstream_models(name: str, request: Request):
                        "cost_cached_input_price": (_per_million(pricing["input_cache_read"])
                                                    if "input_cache_read" in pricing else None)})
     return sorted(result, key=lambda x: x["id"])
+
+
+# ---------------------------------------------------------------- 收益試算
+
+TAIWAN = timezone(timedelta(hours=8))
+
+
+def revenue_periods(now_utc: datetime) -> list[tuple[str, str, datetime]]:
+    """（代號、名稱、起點）。起點是不含時區的 UTC，跟資料庫一致；「今天」從台灣時間 00:00 算起。"""
+    today = now_utc.replace(tzinfo=timezone.utc).astimezone(TAIWAN).replace(hour=0, minute=0, second=0,
+                                                                              microsecond=0)
+    return [("today", "今天（台灣時間 00:00 起）", today.astimezone(timezone.utc).replace(tzinfo=None)),
+            ("7d", "過去 7 天", now_utc - timedelta(days=7)),
+            ("30d", "過去 30 天", now_utc - timedelta(days=30))]
+
+
+def _sum(column):
+    return func.coalesce(func.sum(column), 0)
+
+
+async def revenue_rows(session, since: datetime) -> list[dict]:
+    """依「上游、模型」加總已結算的請求。"""
+    unknown = and_(UsageLog.upstream_cost_micro.is_(None), UsageLog.cost_micro > 0)  # 有收錢，卻不知道上游花多少
+    rows = (await session.execute(
+        select(UsageLog.upstream, UsageLog.model, func.count(), _sum(UsageLog.cost_micro),
+               _sum(UsageLog.upstream_cost_micro), _sum(UsageLog.upstream_allowance_micro),
+               _sum(case((UsageLog.upstream_cost_estimated.is_(True), 1), else_=0)),
+               _sum(case((unknown, 1), else_=0)), _sum(case((unknown, UsageLog.cost_micro), else_=0)))
+        .where(UsageLog.created_at >= since, UsageLog.status != "pending")
+        .group_by(UsageLog.upstream, UsageLog.model)
+        .order_by(UsageLog.upstream, UsageLog.model)
+    )).all()
+    return [{"upstream": upstream, "model": model, "requests": requests, "revenue": revenue, "upstream_cost": spend,
+             "allowance": allowance, "estimated": estimated, "unknown": unknown_count, "unknown_revenue": unknown_rev}
+            for upstream, model, requests, revenue, spend, allowance, estimated, unknown_count, unknown_rev in rows]
+
+
+def _money(row: dict) -> dict:
+    # 毛利只算「知道上游花多少」的那部分；不知道的另外列出來，避免把它們當成全賺
+    profit = row["revenue"] - row["unknown_revenue"] - row["upstream_cost"]
+    return {**row, "revenue": format_usd(row["revenue"]), "upstream_cost": format_usd(row["upstream_cost"]),
+            "allowance": format_usd(row["allowance"]), "unknown_revenue": format_usd(row["unknown_revenue"]),
+            "profit": format_usd(profit) if profit >= 0 else "-" + format_usd(-profit)}
+
+
+@router.get("/api/revenue")
+async def revenue(request: Request):
+    """今天／過去 7 天／過去 30 天：向使用者收了多少、上游花了多少，依上游與模型分開。"""
+    keys = ("requests", "revenue", "upstream_cost", "allowance", "estimated", "unknown", "unknown_revenue")
+    periods = []
+    async with request.app.state.sessionmaker() as session:
+        for code, label, since in revenue_periods(utcnow()):
+            rows = await revenue_rows(session, since)
+            total = {key: sum(row[key] for row in rows) for key in keys}
+            periods.append({"code": code, "label": label, "since": iso_utc(since),
+                            "total": _money(total), "rows": [_money(row) for row in rows]})
+    return {"periods": periods}
 
 
 # ---------------------------------------------------------------- 使用者

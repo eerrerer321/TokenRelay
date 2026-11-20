@@ -8,8 +8,9 @@
 import json
 import logging
 import re
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
+from decimal import ROUND_CEILING, Decimal
 from functools import partial
 from typing import NoReturn
 
@@ -19,7 +20,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from sqlalchemy import select
 
-from app.billing import HoldRejected, calc_cost, estimate_hold, format_usd, place_hold, settle
+from app.billing import MICRO, HoldRejected, calc_cost, estimate_hold, format_usd, place_hold, settle
 from app.config import ModelConfig, Settings, UpstreamConfig
 from app.models import ApiKey
 from app.security import sha256_hex
@@ -81,6 +82,18 @@ async def openai_error_handler(request: Request, exc: OpenAIError) -> JSONRespon
 class KeyAuth:
     user_id: int
     api_key_id: int
+    # 使用者送來的標頭：上游要對話 ID（session_header）時，從這裡讀使用者的工具帶的值
+    request_headers: Mapping[str, str] = field(default_factory=dict, repr=False)
+
+
+def upstream_session_id(auth: KeyAuth, client_value: str) -> str:
+    """給上游的對話 ID：同一段對話固定同一個值，上游才能把它導到同一台機器、命中快取。
+
+    使用者的工具有帶就沿用，但先混入使用者 ID 再雜湊：不同使用者送一樣的值也不會變成同一個 ID，
+    也不會把使用者自己填的內容原樣送到上游。沒帶就用 API key 算一個固定值。
+    """
+    source = f"user:{auth.user_id}:{client_value}" if client_value else f"key:{auth.api_key_id}"
+    return "ses_" + sha256_hex(source)[:32]
 
 
 async def api_key_auth(request: Request) -> KeyAuth:
@@ -99,7 +112,7 @@ async def api_key_auth(request: Request) -> KeyAuth:
         ).first()
     if row is None:
         raise OpenAIError(401, "API key 無效或已停用", "invalid_api_key", "authentication_error")
-    return KeyAuth(user_id=row.user_id, api_key_id=row.id)
+    return KeyAuth(user_id=row.user_id, api_key_id=row.id, request_headers=request.headers)
 
 
 @router.get("/models")
@@ -344,6 +357,54 @@ class SettlingStreamingResponse(StreamingResponse):
                 await self._on_close()
 
 
+# 有些上游會在用量裡附上「這次花了站方多少錢」：OpenRouter 的 cost／cost_details、
+# opencode 的 cost／opencode（含用掉多少方案額度）。這是站方的進價，不能轉給使用者
+UPSTREAM_COST_FIELDS = ("cost", "cost_details", "opencode")
+
+
+def strip_upstream_cost(data: dict) -> dict:
+    """拿掉用量裡的上游成本，回傳拿掉的欄位（收益試算要用；空的 = 沒改到）。
+
+    用量可能在最外層（chat、responses、messages），或包在 response（Responses 串流的 response.completed）、
+    message（Anthropic 串流的 message_start）裡。
+    """
+    removed = {}
+    for holder in (data, data.get("response"), data.get("message")):
+        usage = holder.get("usage") if isinstance(holder, dict) else None
+        if isinstance(usage, dict):
+            for key in UPSTREAM_COST_FIELDS:
+                if key in usage:
+                    removed[key] = usage.pop(key)
+    return removed
+
+
+def strip_upstream_cost_from_sse(line: str) -> tuple[str, dict]:
+    """串流的一行（data: {...}）：有上游成本就拿掉後重新編碼，沒有就原樣回傳。也回傳拿掉的欄位。"""
+    if not line.startswith("data:") or not any(f'"{key}"' in line for key in UPSTREAM_COST_FIELDS):
+        return line, {}
+    try:
+        data = json.loads(line[5:])
+    except ValueError:
+        return line, {}
+    removed = strip_upstream_cost(data) if isinstance(data, dict) else {}
+    if not removed:
+        return line, {}
+    return "data: " + json.dumps(data, ensure_ascii=False, separators=(",", ":")), removed
+
+
+MAX_REPORTED_USD = Decimal(1_000_000)  # 上游回報的單筆花費超過這個數字一定是錯的，當作沒回報
+
+
+def reported_usd_to_micro(value) -> int | None:
+    """上游回報的美元數字（例如 0.00412）→ micro，無條件進位。不是正常數字就回 None（當作沒回報）。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    amount = Decimal(str(value))
+    if not amount.is_finite() or amount < 0 or amount > MAX_REPORTED_USD:
+        return None
+    return int((amount * MICRO).to_integral_value(rounding=ROUND_CEILING))
+
+
 @dataclass
 class StreamProgress:
     usage: Usage | None = None
@@ -391,22 +452,50 @@ class RelayJob:
         self.api = api
         self._cost = cost
         self.upstream_key = upstream.api_key
-        # 網址格式在讀設定檔時就驗證過（UpstreamConfig），這裡建立請求不會因為網址失敗
+        # 網址格式、附加標頭在讀設定檔時就驗證過（UpstreamConfig），這裡建立請求不會因為它們失敗。
+        # 附加標頭先放，站方自己的驗證標頭後放（設定檔也禁止寫這些名稱）
+        self.headers = {**upstream.headers, "Content-Type": "application/json"}
+        if upstream.session_header:
+            client_value = auth.request_headers.get(upstream.session_header, "")
+            self.headers[upstream.session_header] = upstream_session_id(auth, client_value)
         if api.anthropic:
             self.url = upstream.anthropic_base_url.rstrip("/") + api.path
             # 不轉送使用者的 anthropic-beta 標頭：beta 功能可能改變計費（例如更長的 context 價格不同）
-            self.headers = {"x-api-key": upstream.api_key, "anthropic-version": ANTHROPIC_VERSION,
-                            "Content-Type": "application/json"}
+            self.headers["anthropic-version"] = ANTHROPIC_VERSION
+            if upstream.anthropic_auth == "bearer":
+                self.headers["Authorization"] = f"Bearer {upstream.api_key}"
+            else:
+                self.headers["x-api-key"] = upstream.api_key
         else:
             self.url = upstream.base_url.rstrip("/") + api.path
-            self.headers = {"Authorization": f"Bearer {upstream.api_key}", "Content-Type": "application/json"}
+            self.headers["Authorization"] = f"Bearer {upstream.api_key}"
         self.settled = False
+        self.upstream_reported: dict = {}  # 上游在用量裡附的成本欄位（已從回應拿掉，只給收益試算用）
 
     def cost(self, usage: Usage) -> int:
         if self._cost is not None:  # 例如圖片按張數計費
             return self._cost(usage)
         return calc_cost(usage[0], usage[1], self.model.input_price_micro, self.model.output_price_micro or 0,
                          cached_tokens=usage[2], cached_input_price_micro=self.model.cached_input_price_micro)
+
+    def upstream_spend(self, usage: Usage | None) -> tuple[int | None, bool | None, int | None]:
+        """（上游收站方多少、是不是估的、用掉多少 opencode Go 方案額度）。只給收益試算，不影響收費。
+
+        上游有回報 cost 就用回報值（opencode Go 額度內是 0，額度另外記）；沒有就用進價 × token 數估算；
+        進價沒填、或按張數計費的圖片 → 不知道（None）。
+        """
+        cost = reported_usd_to_micro(self.upstream_reported.get("cost"))
+        opencode = self.upstream_reported.get("opencode")
+        allowance = reported_usd_to_micro(opencode.get("allowance")) if isinstance(opencode, dict) else None
+        if cost is not None:
+            return cost, False, allowance
+        model = self.model
+        if (usage is None or self._cost is not None or model.cost_input_price_micro is None
+                or (model.kind == "chat" and model.cost_output_price_micro is None)):
+            return None, None, allowance
+        estimate = calc_cost(usage[0], usage[1], model.cost_input_price_micro, model.cost_output_price_micro or 0,
+                             cached_tokens=usage[2], cached_input_price_micro=model.cost_cached_input_price_micro)
+        return estimate, True, allowance
 
     def sanitize(self, text: str) -> str:
         """上游的錯誤訊息可能夾帶站方的 key 或類似 key 的字串，轉給使用者前先遮掉。"""
@@ -420,6 +509,11 @@ class RelayJob:
             return
         self.settled = True
         try:
+            try:
+                spend, estimated, allowance = self.upstream_spend(usage)
+            except Exception:  # 只是收益試算用的數字，算錯也不能讓這筆停在 pending
+                log.exception("用量 #%s 的上游花費算不出來", self.usage_id)
+                spend = estimated = allowance = None
             with anyio.CancelScope(shield=True):
                 for attempt in range(1, self.SETTLE_ATTEMPTS + 1):
                     try:
@@ -427,7 +521,9 @@ class RelayJob:
                             self.sm, self.usage_id, cost=cost, status=status,
                             prompt_tokens=usage[0] if usage else None,
                             completion_tokens=usage[1] if usage else None,
+                            cached_tokens=usage[2] if usage else None,
                             upstream_status=upstream_status,
+                            upstream_cost=spend, upstream_cost_estimated=estimated, upstream_allowance=allowance,
                         )
                         break
                     except Exception:
@@ -505,6 +601,7 @@ class RelayJob:
                 await self.finish(self.hold, "bad_upstream_response")
                 raise OpenAIError(502, "上游回應格式錯誤", "bad_upstream_response", "api_error")
             usage = self.api.usage_from_json(data)
+            self.upstream_reported = strip_upstream_cost(data)
             if usage is None:
                 await self.finish(self.hold, "no_usage")
             else:
@@ -560,6 +657,8 @@ class RelayJob:
             tracker.feed(line)
             if tracker.usage is not None:
                 progress.usage = tracker.usage
+            line, removed = strip_upstream_cost_from_sse(line)
+            self.upstream_reported.update(removed)
             if self.upstream_key and self.upstream_key in line:  # 串流裡的錯誤事件若夾帶站方 key，也不能轉出去
                 line = line.replace(self.upstream_key, "[已遮蔽]")
             yield line + "\n"
@@ -603,7 +702,7 @@ async def start_job(state, auth: KeyAuth, model: ModelConfig, upstream: Upstream
     try:
         usage_id = await place_hold(
             state.sessionmaker, user_id=auth.user_id, api_key_id=auth.api_key_id,
-            model=model.name, stream=stream, hold=hold,
+            model=model.name, stream=stream, hold=hold, upstream=upstream.name,
         )
     except HoldRejected as exc:
         limiter.release(auth.user_id)

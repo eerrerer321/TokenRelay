@@ -8,6 +8,7 @@
 import json
 import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
 from typing import NoReturn
@@ -53,6 +54,9 @@ MAX_TOKEN_FIELDS = ("max_tokens", "max_completion_tokens")
 NOT_SENT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout, httpx.UnsupportedProtocol)
 # 這些上游錯誤是「請求本身有問題」，把（遮蔽過的）原因告訴使用者；其他錯誤一律改成通用訊息
 CLIENT_ERROR_STATUS = {400, 404, 413, 422}
+# 上游前面的閘道（例如 Cloudflare 的 524）等太久先回逾時，後面的模型可能照樣跑完、照樣收費。
+# 當下無法知道上游有沒有扣錢 → 先收預扣（跟中途斷線一樣），站長對照上游帳單，沒扣錢再用補帳退回
+GATEWAY_TIMEOUT_STATUS = {504, 524}
 KEY_LIKE = re.compile(r"\bsk-[A-Za-z0-9_\-]{4,}")
 
 
@@ -64,7 +68,10 @@ class OpenAIError(Exception):
         self.status, self.message, self.code, self.type = status, message, code, type_
 
 
-async def openai_error_handler(_request: Request, exc: OpenAIError) -> JSONResponse:
+async def openai_error_handler(request: Request, exc: OpenAIError) -> JSONResponse:
+    if request.url.path.startswith("/v1/messages"):  # Claude Code 這類 Anthropic 格式的工具看得懂的錯誤格式
+        return JSONResponse({"type": "error", "error": {"type": exc.type, "message": exc.message}},
+                            status_code=exc.status)
     return JSONResponse(
         {"error": {"message": exc.message, "type": exc.type, "code": exc.code}}, status_code=exc.status
     )
@@ -78,7 +85,9 @@ class KeyAuth:
 
 async def api_key_auth(request: Request) -> KeyAuth:
     scheme, _, token = request.headers.get("authorization", "").partition(" ")
-    if scheme.lower() != "bearer" or not token.startswith("sk-"):
+    if scheme.lower() != "bearer":
+        token = request.headers.get("x-api-key", "")  # Anthropic 格式的工具（Claude Code）用這個標頭帶 key
+    if not token.startswith("sk-"):
         raise OpenAIError(401, "缺少 API key（Authorization: Bearer sk-...）", "invalid_api_key", "authentication_error")
     async with request.app.state.sessionmaker() as session:
         row = (
@@ -95,7 +104,7 @@ async def api_key_auth(request: Request) -> KeyAuth:
 
 @router.get("/models")
 async def list_models(request: Request, _auth: KeyAuth = Depends(api_key_auth)):
-    names = sorted(request.app.state.settings.models)
+    names = sorted(request.app.state.settings.open_models())
     # created 是 OpenAI 格式的必填欄位；模型寫在設定檔裡，沒有「建立時間」，填 0
     return {"object": "list", "data": [{"id": name, "object": "model", "created": 0, "owned_by": "relay"}
                                        for name in names]}
@@ -133,12 +142,18 @@ def parse_json_object(raw: bytes) -> dict:
     return body
 
 
-def load_route(settings: Settings, name) -> tuple[ModelConfig, UpstreamConfig]:
+KIND_NAMES = {"chat": "對話", "embedding": "embeddings", "image": "產生圖片", "speech": "文字轉語音"}
+
+
+def load_route(settings: Settings, name, kind: str = "chat") -> tuple[ModelConfig, UpstreamConfig]:
     if not isinstance(name, str) or not name:
         raise OpenAIError(400, "缺少 model 參數", "missing_model")
-    model = settings.models.get(name)
-    if model is None:
+    model = settings.open_models().get(name)
+    if model is None:  # 下架的模型跟不存在一樣回應
         raise OpenAIError(404, f"模型 {name[:100]} 不存在或未開放", "model_not_found")
+    if model.kind != kind:  # 例如拿對話模型打 embeddings：價格的算法不一樣，不能混用
+        raise OpenAIError(400, f"模型 {name[:100]} 是{KIND_NAMES[model.kind]}模型，不能用在這個 API",
+                          "model_not_supported")
     return model, settings.upstreams[model.upstream]
 
 
@@ -240,20 +255,39 @@ def encode_upstream_body(body: dict) -> bytes:
     不會發生「錢已經扣了，請求卻根本送不出去」。"""
     try:
         return json.dumps(body, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode()
-    except ValueError:
-        raise OpenAIError(400, "請求包含無法轉送的數值（NaN 或 Infinity）", "invalid_json") from None
+    except (ValueError, RecursionError):  # RecursionError：超深的巢狀（parse_json_object 通常已先擋下）
+        raise OpenAIError(400, "請求包含無法轉送的內容（NaN、Infinity 或過深的巢狀）", "invalid_json") from None
 
 
-def parse_usage(usage) -> tuple[int, int] | None:
+def _valid_count(value) -> bool:
+    return type(value) is int and value >= 0
+
+
+def parse_cached_tokens(usage: dict, prompt: int) -> int:
+    """prompt_tokens 裡有多少是快取命中。各家欄位不同：
+    OpenAI 格式（OpenAI、OpenRouter、Gemini 等）放在 prompt_tokens_details.cached_tokens；
+    DeepSeek 放在 prompt_cache_hit_tokens。看不懂或數字不合理 → 當作 0，照一般輸入價收。"""
+    details = usage.get("prompt_tokens_details")
+    cached = details.get("cached_tokens") if isinstance(details, dict) else None
+    if cached is None:
+        cached = usage.get("prompt_cache_hit_tokens")
+    return cached if _valid_count(cached) and cached <= prompt else 0
+
+
+Usage = tuple[int, int, int]  # (輸入 tokens, 輸出 tokens, 輸入裡快取命中的 tokens)
+
+
+def parse_usage(usage) -> tuple[int, int, int] | None:
+    """回傳 (輸入 tokens, 輸出 tokens, 輸入裡快取命中的 tokens)。"""
     if not isinstance(usage, dict):
         return None
     prompt, completion = usage.get("prompt_tokens"), usage.get("completion_tokens")
-    if type(prompt) is int and type(completion) is int and prompt >= 0 and completion >= 0:
-        return prompt, completion
+    if _valid_count(prompt) and _valid_count(completion):
+        return prompt, completion, parse_cached_tokens(usage, prompt)
     return None
 
 
-def usage_from_sse_line(line: str) -> tuple[int, int] | None:
+def usage_from_sse_line(line: str) -> tuple[int, int, int] | None:
     if not line.startswith("data:"):
         return None
     payload = line[5:].strip()
@@ -312,8 +346,34 @@ class SettlingStreamingResponse(StreamingResponse):
 
 @dataclass
 class StreamProgress:
-    usage: tuple[int, int] | None = None
+    usage: Usage | None = None
     completed: bool = False
+
+
+class ChatStreamUsage:
+    """從串流的每一行找用量。不同 API 的串流格式不同，各自有一個這樣的類別（見 app/apis.py）。"""
+
+    def __init__(self):
+        self.usage: Usage | None = None
+
+    def feed(self, line: str) -> None:
+        usage = usage_from_sse_line(line)
+        if usage is not None:
+            self.usage = usage
+
+
+@dataclass(frozen=True)
+class ApiFormat:
+    """一種上游 API 的轉發方式：打哪個網址、怎麼從回應和串流讀出用量。"""
+
+    path: str  # 接在上游 base_url 後面，例如 /chat/completions
+    usage_from_json: Callable[[dict], Usage | None]
+    stream_usage: Callable[[], object]  # 回傳有 feed(line) 方法和 usage 屬性的物件
+    anthropic: bool = False  # True：打上游的 anthropic_base_url，用 x-api-key 驗證
+
+
+CHAT_API = ApiFormat("/chat/completions", lambda data: parse_usage(data.get("usage")), ChatStreamUsage)
+ANTHROPIC_VERSION = "2023-06-01"
 
 
 class RelayJob:
@@ -322,20 +382,31 @@ class RelayJob:
     SETTLE_ATTEMPTS = 3
 
     def __init__(self, state, auth: KeyAuth, model: ModelConfig, upstream: UpstreamConfig, content: bytes,
-                 hold: int, usage_id: int):
+                 hold: int, usage_id: int, api: ApiFormat = CHAT_API, cost: Callable[[Usage], int] | None = None):
         self.sm = state.sessionmaker
         self.http: httpx.AsyncClient = state.http
         self.limiter = state.limiter
         self.auth, self.model, self.content = auth, model, content
         self.hold, self.usage_id = hold, usage_id
+        self.api = api
+        self._cost = cost
         self.upstream_key = upstream.api_key
         # 網址格式在讀設定檔時就驗證過（UpstreamConfig），這裡建立請求不會因為網址失敗
-        self.url = upstream.base_url.rstrip("/") + "/chat/completions"
-        self.headers = {"Authorization": f"Bearer {upstream.api_key}", "Content-Type": "application/json"}
+        if api.anthropic:
+            self.url = upstream.anthropic_base_url.rstrip("/") + api.path
+            # 不轉送使用者的 anthropic-beta 標頭：beta 功能可能改變計費（例如更長的 context 價格不同）
+            self.headers = {"x-api-key": upstream.api_key, "anthropic-version": ANTHROPIC_VERSION,
+                            "Content-Type": "application/json"}
+        else:
+            self.url = upstream.base_url.rstrip("/") + api.path
+            self.headers = {"Authorization": f"Bearer {upstream.api_key}", "Content-Type": "application/json"}
         self.settled = False
 
-    def cost(self, usage: tuple[int, int]) -> int:
-        return calc_cost(usage[0], usage[1], self.model.input_price_micro, self.model.output_price_micro)
+    def cost(self, usage: Usage) -> int:
+        if self._cost is not None:  # 例如圖片按張數計費
+            return self._cost(usage)
+        return calc_cost(usage[0], usage[1], self.model.input_price_micro, self.model.output_price_micro or 0,
+                         cached_tokens=usage[2], cached_input_price_micro=self.model.cached_input_price_micro)
 
     def sanitize(self, text: str) -> str:
         """上游的錯誤訊息可能夾帶站方的 key 或類似 key 的字串，轉給使用者前先遮掉。"""
@@ -343,7 +414,7 @@ class RelayJob:
             text = text.replace(self.upstream_key, "[已遮蔽]")
         return KEY_LIKE.sub("sk-***", text)[:300]
 
-    async def finish(self, cost: int, status: str, usage: tuple[int, int] | None = None,
+    async def finish(self, cost: int, status: str, usage: Usage | None = None,
                      upstream_status: int | None = None) -> None:
         if self.settled:
             return
@@ -377,6 +448,12 @@ class RelayJob:
         raise OpenAIError(502, "上游連線中途中斷", "upstream_broken", "api_error") from exc
 
     async def upstream_error(self, status: int, content: bytes) -> NoReturn:
+        if status in GATEWAY_TIMEOUT_STATUS:
+            await self.finish(self.hold, "upstream_timeout", upstream_status=status)
+            log.warning("上游逾時 HTTP %s（model=%s，用量 #%s），已收預扣，請對照上游帳單確認",
+                        status, self.model.name, self.usage_id)
+            raise OpenAIError(504, "上游處理逾時：上游可能已經產生費用，這次先收預扣；站長確認上游沒收費會退回",
+                              "upstream_timeout", "api_error")
         await self.finish(0, "upstream_error", upstream_status=status)
         log.warning("上游回應 HTTP %s（model=%s）", status, self.model.name)
         if status in CLIENT_ERROR_STATUS:
@@ -427,7 +504,7 @@ class RelayJob:
             if not isinstance(data, dict):
                 await self.finish(self.hold, "bad_upstream_response")
                 raise OpenAIError(502, "上游回應格式錯誤", "bad_upstream_response", "api_error")
-            usage = parse_usage(data.get("usage"))
+            usage = self.api.usage_from_json(data)
             if usage is None:
                 await self.finish(self.hold, "no_usage")
             else:
@@ -455,11 +532,34 @@ class RelayJob:
             headers={"Cache-Control": "no-cache"},
         )
 
+    async def run_binary(self, usage: Usage) -> Response:
+        """回應不是 JSON（例如語音檔）、費用在送出前就算好的請求：成功就收預扣的金額。"""
+        try:
+            resp = await self._open()
+            if resp.status_code >= 400:
+                await self._fail_from_error_response(resp)
+            try:
+                content = await resp.aread()
+            except httpx.HTTPError as exc:
+                await self.finish(self.hold, "upstream_broken")
+                raise OpenAIError(502, "上游連線中途中斷", "upstream_broken", "api_error") from exc
+            finally:
+                await resp.aclose()
+            # 上游可能用 HTTP 200 回傳夾帶 key 的錯誤 JSON，跟 run_once 一樣先遮掉
+            if self.upstream_key:
+                content = content.replace(self.upstream_key.encode(), "[已遮蔽]".encode())
+            await self.finish(self.hold, "ok", usage)
+            return Response(content, media_type=resp.headers.get("content-type", "application/octet-stream"))
+        finally:
+            if not self.settled:
+                await self.finish(self.hold, "error")
+
     async def _relay_lines(self, resp: httpx.Response, progress: StreamProgress):
+        tracker = self.api.stream_usage()
         async for line in resp.aiter_lines():
-            usage = usage_from_sse_line(line)
-            if usage is not None:
-                progress.usage = usage
+            tracker.feed(line)
+            if tracker.usage is not None:
+                progress.usage = tracker.usage
             if self.upstream_key and self.upstream_key in line:  # 串流裡的錯誤事件若夾帶站方 key，也不能轉出去
                 line = line.replace(self.upstream_key, "[已遮蔽]")
             yield line + "\n"
@@ -487,8 +587,14 @@ async def chat_completions(request: Request, auth: KeyAuth = Depends(api_key_aut
     content = encode_upstream_body(upstream_body)
     # 用「實際要送給上游的內容」估算，上游計算 token 的對象就是它
     hold = estimate_hold(len(content), images, model.image_tokens, output_cap,
-                         model.input_price_micro, model.output_price_micro)
+                         model.input_price_micro, model.output_price_micro, has_tools=bool(upstream_body.get("tools")))
+    job = await start_job(state, auth, model, upstream, content, hold, stream)
+    return await (job.run_stream() if stream else job.run_once())
 
+
+async def start_job(state, auth: KeyAuth, model: ModelConfig, upstream: UpstreamConfig, content: bytes, hold: int,
+                    stream: bool, api: ApiFormat = CHAT_API, cost: Callable[[Usage], int] | None = None) -> RelayJob:
+    """佔用同時請求數的名額並預扣。之後由 RelayJob 負責結算與歸還名額。"""
     limiter = state.limiter
     if not limiter.try_acquire(auth.user_id):
         raise OpenAIError(
@@ -510,5 +616,4 @@ async def chat_completions(request: Request, auth: KeyAuth = Depends(api_key_aut
         limiter.release(auth.user_id)
         raise
 
-    job = RelayJob(state, auth, model, upstream, content, hold, usage_id)
-    return await (job.run_stream() if stream else job.run_once())
+    return RelayJob(state, auth, model, upstream, content, hold, usage_id, api, cost)

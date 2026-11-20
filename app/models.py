@@ -33,6 +33,19 @@ class WebSession(Base):
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
 
+class PasswordReset(Base):
+    """站長在後台產生的一次性重設密碼連結。只存 token 的雜湊。"""
+
+    __tablename__ = "password_resets"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    expires_at: Mapped[datetime]
+    used_at: Mapped[datetime | None]
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
 class ApiKey(Base):
     """給 Cherry Studio 之類工具用的 sk- key。只存雜湊，完整 key 只在建立時顯示一次。"""
 

@@ -110,6 +110,22 @@ async def create_order(sm: async_sessionmaker, settings: Settings, user_id: int,
     return order
 
 
+@router.get("/deposits/options")
+async def deposit_options(request: Request, _user: User = Depends(current_user)):
+    """儲值頁要顯示的設定：收哪些幣、金額範圍、在哪條鏈。"""
+    settings: Settings = request.app.state.settings
+    return {
+        "enabled": settings.chain_enabled,
+        "chain": settings.chain_name,
+        "to_address": settings.receive_address,
+        "tokens": [{"symbol": t.symbol, "contract": t.contract} for t in settings.token_configs().values()],
+        "min_usd": settings.deposit_min_usd,
+        "max_usd": settings.deposit_max_usd,
+        "ttl_minutes": settings.deposit_ttl_minutes,
+        "confirmations": settings.chain_confirmations,
+    }
+
+
 @router.get("/deposits")
 async def list_deposits(request: Request, user: User = Depends(current_user)):
     async with request.app.state.sessionmaker() as session:

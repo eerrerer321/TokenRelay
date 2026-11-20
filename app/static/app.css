@@ -1,0 +1,10 @@
+/* 只放 Bootstrap 沒有的少量樣式 */
+#order-qr {
+  max-width: 220px;
+  image-rendering: pixelated;
+}
+
+td code,
+#api-base {
+  word-break: break-all;
+}

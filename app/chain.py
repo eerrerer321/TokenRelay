@@ -6,6 +6,7 @@
 
 import asyncio
 import logging
+from decimal import Decimal
 
 import httpx
 from sqlalchemy import update
@@ -24,6 +25,12 @@ TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523
 def address_topic(address: str) -> str:
     """地址放在 topic 裡時，會在前面補 0 補滿 32 bytes。"""
     return "0x" + "0" * 24 + address.lower()[2:]
+
+
+def format_units(raw: int, decimals: int) -> str:
+    """鏈上的整數金額 → 人看的數字，例如 1500000000000000000（18 位小數）→ 1.5"""
+    text = f"{Decimal(raw) / (Decimal(10) ** decimals):f}"
+    return text.rstrip("0").rstrip(".") if "." in text else text
 
 
 class RpcError(Exception):
@@ -51,6 +58,16 @@ class ChainWatcher:
                 if method == "eth_getLogs" else ""
             raise RpcError(f"{method} 失敗：{data['error']}{hint}")
         return data["result"]
+
+    async def wallet_balances(self) -> dict[str, str]:
+        """收款地址目前的餘額（給後台看）。BNB 是付手續費（gas）用的：要把代幣轉出去，錢包裡得有一點 BNB。"""
+        address = self.settings.receive_address
+        balances = {"BNB": format_units(int(await self._rpc("eth_getBalance", [address, "latest"]), 16), 18)}
+        for symbol, token in self.tokens.items():
+            data = "0x70a08231" + address_topic(address)[2:]  # ERC-20 的 balanceOf(地址)
+            raw = await self._rpc("eth_call", [{"to": token.contract, "data": data}, "latest"])
+            balances[symbol] = format_units(int(raw, 16), token.decimals)
+        return balances
 
     def _is_expected_log(self, entry: dict, token: TokenConfig, from_block: int, to_block: int) -> bool:
         """再檢查一次 RPC 回來的資料。正常節點已經幫我們過濾過，這是多一層保險。"""

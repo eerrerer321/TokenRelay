@@ -10,8 +10,9 @@ import pytest
 from sqlalchemy import select
 
 from app import relay
-from app.billing import HoldRejected, calc_cost, estimate_hold, place_hold
+from app.billing import TOOLS_MARGIN_TOKENS, HoldRejected, calc_cost, estimate_hold, place_hold
 from app.config import ModelConfig
+from app.main import create_app
 from app.models import ApiKey, UsageLog
 from app.relay import encode_upstream_body, prepare_upstream_body
 from tests.conftest import auth
@@ -32,7 +33,8 @@ def expected_hold(raw: bytes, *, image_tokens: int = 0, max_output_tokens: int =
                         output_price_micro=2_000_000, max_output_tokens=max_output_tokens,
                         max_tokens_field="max_tokens", image_tokens=image_tokens)
     body, cap, _stream, images = prepare_upstream_body(json.loads(raw), model)
-    return estimate_hold(len(encode_upstream_body(body)), images, image_tokens, cap, 1_000_000, 2_000_000)
+    return estimate_hold(len(encode_upstream_body(body)), images, image_tokens, cap, 1_000_000, 2_000_000,
+                         has_tools=bool(body.get("tools")))
 
 
 async def post_chat(h, key: str, raw):
@@ -67,6 +69,14 @@ def test_cost_rounds_up_so_tiny_requests_are_never_free():
     assert calc_cost(10, 0, 1, 1) == 1
     assert calc_cost(0, 0, 1, 1) == 0
     assert calc_cost(1_000_000, 1_000_000, 3_000_000, 15_000_000) == 18_000_000
+
+
+def test_cost_uses_cached_price_only_for_cached_tokens():
+    # 100 個輸入裡 80 個命中快取：20 × 1 + 80 × 0.1 = 28 micro
+    assert calc_cost(100, 0, 1_000_000, 0, cached_tokens=80, cached_input_price_micro=100_000) == 28
+    assert calc_cost(100, 0, 1_000_000, 0, cached_tokens=80) == 100  # 沒設快取價 → 照輸入價
+    # 命中數比總輸入還多（上游回報有誤）→ 最多只算到總輸入，不會變成負數
+    assert calc_cost(100, 0, 1_000_000, 0, cached_tokens=500, cached_input_price_micro=0) == 0
 
 
 def test_hold_formula():
@@ -107,6 +117,44 @@ async def test_stream_forces_usage_and_charges_actual(h):
     assert h.upstream.requests[-1]["body"]["stream_options"]["include_usage"] is True
     assert await h.balance() == CREDIT - ACTUAL_COST
     assert (await last_usage(h)).status == "ok"
+
+
+CACHE_REPORTS = {  # 假上游回報「10 個輸入裡 8 個命中快取」的各家寫法
+    "openai": {"prompt_tokens_details": {"cached_tokens": 8}},
+    "deepseek": {"prompt_cache_hit_tokens": 8, "prompt_cache_miss_tokens": 2},
+}
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["json", "stream"])
+@pytest.mark.parametrize("report", CACHE_REPORTS)
+async def test_cached_input_tokens_use_cached_price(h, report, stream):
+    # 快取價 0.1 micro/token：2 × 1 + 8 × 0.1 + 20 × 2 = 42.8 → 進位 43
+    key = await setup_user(h, cached_input_price=100_000)
+    h.upstream.usage_extra = CACHE_REPORTS[report]
+    assert (await post_chat(h, key, chat_body(stream=stream))).status_code == 200
+    assert (await last_usage(h)).cost_micro == 43
+    assert await h.balance() == CREDIT - 43
+
+
+async def test_cache_hits_without_cached_price_are_full_price(h):
+    key = await setup_user(h)  # 沒設定 cached_input_price
+    h.upstream.usage_extra = CACHE_REPORTS["openai"]
+    await post_chat(h, key, chat_body())
+    assert await h.balance() == CREDIT - ACTUAL_COST
+
+
+@pytest.mark.parametrize("extra", [
+    {"prompt_tokens_details": {"cached_tokens": 11}},  # 比輸入總數還多
+    {"prompt_tokens_details": {"cached_tokens": -1}},
+    {"prompt_tokens_details": {"cached_tokens": "8"}},
+    {"prompt_tokens_details": "8"},
+    {"prompt_cache_hit_tokens": True},
+], ids=["more-than-prompt", "negative", "text", "not-object", "bool"])
+async def test_unreasonable_cache_numbers_charge_full_input_price(h, extra):
+    key = await setup_user(h, cached_input_price=0)  # 快取免費：如果誤信這些數字，費用會明顯變少
+    h.upstream.usage_extra = extra
+    assert (await post_chat(h, key, chat_body())).status_code == 200
+    assert (await last_usage(h)).cost_micro == ACTUAL_COST
 
 
 async def test_image_request_holds_model_specific_image_tokens(h):
@@ -192,6 +240,22 @@ async def test_negative_hold_is_refused(h):
         await place_hold(h.sm, user_id=api_key.user_id, api_key_id=api_key.id, model="gpt-test",
                          stream=False, hold=-1000)
     assert await h.balance() == CREDIT
+
+
+async def test_holds_left_pending_by_a_crash_are_settled_on_startup(h):
+    """請求途中伺服器當機 → 那筆預扣停在 pending。下次啟動要自動結算，不能永遠卡著。"""
+    await setup_user(h)
+    async with h.sm() as s:
+        api_key = (await s.execute(select(ApiKey))).scalar_one()
+    await place_hold(h.sm, user_id=api_key.user_id, api_key_id=api_key.id, model="gpt-test", stream=True, hold=500)
+
+    restarted = create_app(h.app.state.settings, start_watcher=False)  # 模擬重啟：同一個資料庫再啟動一次
+    async with restarted.router.lifespan_context(restarted):
+        pass
+    usage = await last_usage(h)
+    # 跟「拿不到用量」同一個規則：上游可能已經在算錢，收全額預扣
+    assert (usage.status, usage.cost_micro) == ("abandoned", 500)
+    assert await h.balance() == CREDIT - 500
 
 
 @pytest.mark.parametrize("fail_after_commit", [False, True])
@@ -463,6 +527,42 @@ async def test_upstream_server_error_is_refunded(h):
     h.upstream.mode = "error500"
     assert (await post_chat(h, key, chat_body())).status_code == 502
     assert await h.balance() == CREDIT
+
+
+@pytest.mark.parametrize("mode", ["error504", "error524"])
+@pytest.mark.parametrize("stream", [False, True])
+async def test_upstream_gateway_timeout_keeps_hold_for_owner_review(h, mode, stream):
+    """閘道逾時時上游可能已經跑完並收費，站方無從得知 → 先收預扣，標成 upstream_timeout 讓站長對帳。"""
+    key = await setup_user(h)
+    h.upstream.mode = mode
+    raw = chat_body(stream=stream)
+    r = await post_chat(h, key, raw)
+    assert r.status_code == 504
+    assert r.json()["error"]["code"] == "upstream_timeout"
+    usage = await last_usage(h)
+    assert usage.status == "upstream_timeout"
+    assert usage.upstream_status == int(mode[5:])
+    assert usage.cost_micro == expected_hold(raw)
+    assert await h.balance() == CREDIT - expected_hold(raw)
+
+
+async def test_request_with_tools_holds_extra_for_hidden_tool_prompt(h):
+    """上游會自動加一段看不到的工具說明並算進輸入，帶 tools 的請求預扣要多留這一段。"""
+    key = await setup_user(h)
+    h.upstream.gate = asyncio.Event()  # 讓請求停在上游，才看得到「預扣中」的金額
+    tools = [{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}]
+    raw = chat_body(tools=tools)
+    task = asyncio.create_task(post_chat(h, key, raw))
+    await wait_until(lambda: h.upstream.requests)
+    held = CREDIT - await h.balance()
+    h.upstream.gate.set()
+    assert (await task).status_code == 200
+
+    body, cap, _stream, _images = prepare_upstream_body(json.loads(raw), ModelConfig(
+        name="gpt-test", upstream="fake", upstream_model="up-gpt-test", input_price_micro=1_000_000,
+        output_price_micro=2_000_000, max_output_tokens=100, max_tokens_field="max_tokens"))
+    without_margin = estimate_hold(len(encode_upstream_body(body)), 0, 0, cap, 1_000_000, 2_000_000)
+    assert held == without_margin + calc_cost(TOOLS_MARGIN_TOKENS, 0, 1_000_000, 0)
 
 
 @pytest.mark.parametrize("mode", ["pool_timeout", "connect_error"])

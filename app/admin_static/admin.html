@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>站長後台 — AI 模型轉發站</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
+        integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH" crossorigin="anonymous">
+</head>
+<body>
+
+<nav class="navbar bg-dark border-bottom" data-bs-theme="dark">
+  <div class="container-fluid">
+    <span class="navbar-brand fw-semibold">站長後台</span>
+    <span class="navbar-text small">只限這台電腦開啟・不需要帳密</span>
+  </div>
+</nav>
+
+<main class="container-fluid py-3">
+  <div id="alerts"></div>
+
+  <ul class="nav nav-tabs mb-3" role="tablist">
+    <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#tab-overview"
+                                 type="button" role="tab">總覽</button></li>
+    <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-models"
+                                 type="button" role="tab">模型與價格</button></li>
+    <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-users"
+                                 type="button" role="tab">使用者</button></li>
+  </ul>
+
+  <div class="tab-content">
+    <!-- ============================================================ 總覽 -->
+    <section class="tab-pane fade show active" id="tab-overview" role="tabpanel">
+      <div class="d-flex justify-content-end mb-2">
+        <button class="btn btn-sm btn-outline-secondary" id="overview-refresh" type="button">重新整理</button>
+      </div>
+      <div class="row g-3 mb-3">
+        <div class="col-6 col-lg-3"><div class="card h-100"><div class="card-body">
+          <div class="small text-body-secondary">使用者</div><div class="fs-4" id="stat-users">-</div>
+        </div></div></div>
+        <div class="col-6 col-lg-3"><div class="card h-100"><div class="card-body">
+          <div class="small text-body-secondary">使用者餘額合計（美元）</div><div class="fs-4" id="stat-owed">-</div>
+          <div class="small text-body-secondary">朋友還能用的額度，錢包裡至少要留這麼多</div>
+        </div></div></div>
+        <div class="col-6 col-lg-3"><div class="card h-100"><div class="card-body">
+          <div class="small text-body-secondary">近 30 天收入（美元）</div><div class="fs-4" id="stat-revenue">-</div>
+        </div></div></div>
+        <div class="col-6 col-lg-3"><div class="card h-100"><div class="card-body">
+          <div class="small text-body-secondary">近 30 天請求數</div><div class="fs-4" id="stat-requests">-</div>
+        </div></div></div>
+      </div>
+      <div class="card">
+        <div class="card-header">收款錢包 <span class="badge text-bg-secondary" id="wallet-chain"></span></div>
+        <div class="card-body">
+          <div class="small text-body-secondary">地址</div>
+          <div class="font-monospace text-break mb-3" id="wallet-address">-</div>
+          <div id="wallet-error" class="alert alert-warning d-none"></div>
+          <table class="table table-sm w-auto mb-0">
+            <thead><tr><th>幣別</th><th class="text-end">餘額</th></tr></thead>
+            <tbody id="wallet-list"></tbody>
+          </table>
+          <div class="small text-body-secondary mt-2">BNB 是手續費（gas）：要把 USDT/USDC 轉出去，錢包裡得留一點 BNB。</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================================================ 模型與價格 -->
+    <section class="tab-pane fade" id="tab-models" role="tabpanel">
+      <div class="d-flex flex-wrap gap-2 justify-content-between align-items-center mb-2">
+        <div class="small text-body-secondary">價格單位：美元 / 100 萬 tokens（文字轉語音是 / 100 萬字元，產生圖片是 / 張）。儲存後直接寫回 config.ini（其他內容與註解不動），不用重啟。</div>
+        <button class="btn btn-primary btn-sm" id="model-add" type="button">新增模型</button>
+      </div>
+      <div id="models-readonly" class="alert alert-warning d-none">伺服器不是從 config.ini 啟動的，只能看、不能改。</div>
+      <div class="table-responsive">
+        <table class="table table-sm align-middle">
+          <thead>
+            <tr>
+              <th>開放</th><th>模型名稱</th><th>上游 / 上游模型</th>
+              <th class="text-end">售價：輸入</th><th class="text-end">快取</th><th class="text-end">輸出</th>
+              <th class="text-end">進價：輸入</th><th class="text-end">快取</th><th class="text-end">輸出</th>
+              <th class="text-end">售價 ÷ 進價</th><th></th>
+            </tr>
+          </thead>
+          <tbody id="model-list"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ============================================================ 使用者 -->
+    <section class="tab-pane fade" id="tab-users" role="tabpanel">
+      <div class="table-responsive">
+        <table class="table table-sm align-middle">
+          <thead><tr><th>#</th><th>Email</th><th class="text-end">餘額（美元）</th><th>註冊時間</th><th></th></tr></thead>
+          <tbody id="user-list"></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+</main>
+
+<!-- ============================================================ 模型編輯 -->
+<div class="modal fade" id="model-modal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+    <form class="modal-content" id="model-form">
+      <div class="modal-header">
+        <h2 class="modal-title h5" id="model-modal-title">編輯模型</h2>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="關閉"></button>
+      </div>
+      <div class="modal-body">
+        <div class="row g-3">
+          <div class="col-md-6">
+            <label class="form-label" for="f-name">模型名稱（使用者在工具裡選的名稱）</label>
+            <input class="form-control" id="f-name" name="name" required maxlength="100">
+          </div>
+          <div class="col-md-6 d-flex align-items-end">
+            <div class="form-check form-switch mb-2">
+              <input class="form-check-input" type="checkbox" role="switch" id="f-enabled" name="enabled">
+              <label class="form-check-label" for="f-enabled">開放給使用者</label>
+            </div>
+          </div>
+          <div class="col-md-6">
+            <label class="form-label" for="f-kind">類型（決定使用者能打哪個 API、怎麼計費）</label>
+            <select class="form-select" id="f-kind" name="kind">
+              <option value="chat">對話</option>
+              <option value="embedding">embeddings</option>
+              <option value="image">產生圖片</option>
+              <option value="speech">文字轉語音</option>
+            </select>
+          </div>
+          <div class="col-md-6 d-flex align-items-end">
+            <div class="form-text" id="f-kind-hint"></div>
+          </div>
+          <div class="col-md-6">
+            <label class="form-label" for="f-upstream">上游</label>
+            <div class="input-group">
+              <select class="form-select" id="f-upstream" name="upstream"></select>
+              <button class="btn btn-outline-secondary" type="button" id="f-fetch">載入上游模型清單</button>
+            </div>
+          </div>
+          <div class="col-md-6">
+            <label class="form-label" for="f-upstream-model">上游實際的模型名稱（留空 = 跟模型名稱一樣）</label>
+            <input class="form-control" id="f-upstream-model" name="upstream_model" list="upstream-model-options" maxlength="200">
+            <datalist id="upstream-model-options"></datalist>
+            <div class="form-text" id="f-fetch-hint"></div>
+          </div>
+
+          <div class="col-12" data-kinds="chat embedding speech"><hr class="my-1"><h3 class="h6 mb-0">進價（上游收你的錢，只用來算利潤和倍數）</h3></div>
+          <div class="col-4" data-kinds="chat embedding speech"><label class="form-label" for="f-cost-in">輸入</label>
+            <input class="form-control" id="f-cost-in" name="cost_input_price" inputmode="decimal"></div>
+          <div class="col-4" data-kinds="chat"><label class="form-label" for="f-cost-cached">快取命中的輸入</label>
+            <input class="form-control" id="f-cost-cached" name="cost_cached_input_price" inputmode="decimal"></div>
+          <div class="col-4" data-kinds="chat"><label class="form-label" for="f-cost-out">輸出</label>
+            <input class="form-control" id="f-cost-out" name="cost_output_price" inputmode="decimal"></div>
+
+          <div class="col-12" data-kinds="chat embedding speech">
+            <div class="input-group">
+              <span class="input-group-text">售價 = 進價 ×</span>
+              <input class="form-control" id="f-multiplier" inputmode="decimal" value="1.2">
+              <button class="btn btn-outline-primary" type="button" id="f-apply-multiplier">套用到下面的售價</button>
+            </div>
+            <div class="form-text">只會算有填進價的欄位，結果無條件進位到 6 位小數。</div>
+          </div>
+
+          <div class="col-12"><h3 class="h6 mb-0">售價（向使用者收的錢）</h3></div>
+          <div class="col-4" data-kinds="chat embedding speech"><label class="form-label" for="f-in" id="f-in-label">輸入</label>
+            <input class="form-control" id="f-in" name="input_price" inputmode="decimal"></div>
+          <div class="col-4" data-kinds="chat"><label class="form-label" for="f-cached">快取命中的輸入（留空 = 不打折）</label>
+            <input class="form-control" id="f-cached" name="cached_input_price" inputmode="decimal"></div>
+          <div class="col-4" data-kinds="chat"><label class="form-label" for="f-out">輸出</label>
+            <input class="form-control" id="f-out" name="output_price" inputmode="decimal"></div>
+          <div class="col-md-6" data-kinds="image"><label class="form-label" for="f-image-price">每張圖片（美元）</label>
+            <input class="form-control" id="f-image-price" name="image_price" inputmode="decimal">
+            <div class="form-text">size、quality 會影響上游的價格，請用最貴的組合來定價。</div></div>
+
+          <div class="col-12" data-kinds="chat"><hr class="my-1"><h3 class="h6 mb-0">限制</h3></div>
+          <div class="col-md-4" data-kinds="chat"><label class="form-label" for="f-max-out">單次輸出上限（tokens）</label>
+            <input class="form-control" id="f-max-out" name="max_output_tokens" inputmode="numeric"></div>
+          <div class="col-md-4" data-kinds="chat"><label class="form-label" for="f-max-field">上游的輸出上限欄位</label>
+            <select class="form-select" id="f-max-field" name="max_tokens_field">
+              <option value="max_tokens">max_tokens（大部分上游）</option>
+              <option value="max_completion_tokens">max_completion_tokens（OpenAI 新模型）</option>
+            </select></div>
+          <div class="col-md-4" data-kinds="chat"><label class="form-label" for="f-image">一張圖最多算幾 tokens（0 = 不收圖片）</label>
+            <input class="form-control" id="f-image" name="image_tokens" inputmode="numeric"></div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-outline-danger me-auto" id="model-delete">刪除這個模型</button>
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+        <button type="submit" class="btn btn-primary">儲存</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- ============================================================ 重設密碼連結 -->
+<div class="modal fade" id="reset-modal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h2 class="modal-title h5">重設密碼連結</h2>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="關閉"></button>
+      </div>
+      <div class="modal-body">
+        <p>把這個連結私訊給 <strong id="reset-email"></strong>。<span id="reset-minutes"></span> 分鐘內有效、只能用一次。</p>
+        <div class="input-group">
+          <input class="form-control font-monospace" id="reset-link" readonly>
+          <button class="btn btn-outline-secondary" type="button" id="reset-copy">複製</button>
+        </div>
+        <div class="form-text" id="reset-hint"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================ 調整餘額 -->
+<div class="modal fade" id="credit-modal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog">
+    <form class="modal-content" id="credit-form">
+      <div class="modal-header">
+        <h2 class="modal-title h5">調整餘額：<span id="credit-email"></span></h2>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="關閉"></button>
+      </div>
+      <div class="modal-body">
+        <div class="mb-3">
+          <label class="form-label" for="credit-usd">金額（美元，負數 = 扣回）</label>
+          <input class="form-control" id="credit-usd" name="usd" inputmode="decimal" required maxlength="32">
+        </div>
+        <div class="mb-3">
+          <label class="form-label" for="credit-note">備註（會寫進帳本）</label>
+          <input class="form-control" id="credit-note" name="note" maxlength="64" value="admin">
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+        <button type="submit" class="btn btn-primary">確定調整</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"
+        integrity="sha384-YvpcrYf0tY3lHB60NNkmXc5s9fDVZLESaAA55NDzOxhy9GkcIdslK1eN7N6jIeHz" crossorigin="anonymous"></script>
+<script src="/admin/admin.js"></script>
+</body>
+</html>

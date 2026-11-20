@@ -1,4 +1,10 @@
 config.ini
+# 後台改設定時留下的上一版與暫存檔，內容跟 config.ini 一樣有上游 key
+config.ini.bak
+config.ini.tmp
+# 執行紀錄與資料庫備份（備份裡有使用者資料）
+logs/
+backups/
 .env
 *.db
 *.db-journal

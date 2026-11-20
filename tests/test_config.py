@@ -23,6 +23,7 @@ def test_example_config_loads():
     settings = load_settings(EXAMPLE)
     model = settings.models["deepseek-chat"]
     assert (model.upstream, model.input_price_micro, model.output_price_micro) == ("deepseek", 300_000, 1_200_000)
+    assert model.cached_input_price_micro is None  # 範本留空 = 快取不打折
     assert settings.upstreams["deepseek"].base_url == "https://api.deepseek.com/v1"
     assert settings.chain_rpc_url.startswith("https://") and set(settings.tokens) == {"USDT", "USDC"}
     assert not settings.chain_enabled
@@ -41,6 +42,14 @@ def test_values_are_mapped_and_blank_means_default(tmp_path):
     assert settings.max_pending_deposits == 5
     assert settings.tokens["USDT"].decimals == 18 and settings.tokens["USDT"].contract == "0x" + "01" * 20
     assert settings.chain_enabled
+
+
+def test_cached_input_price_is_read(tmp_path):
+    settings = load_settings(write(tmp_path, VALID + "cached_input_price = 0.03\n"))
+    assert settings.models["m"].cached_input_price_micro == 30_000
+    # 跟輸入價一樣也可以（= 不打折，只是寫明）
+    settings = load_settings(write(tmp_path, VALID + "cached_input_price = 0.3\n"))
+    assert settings.models["m"].cached_input_price_micro == 300_000
 
 
 def test_utf8_bom_is_accepted(tmp_path):
@@ -71,12 +80,16 @@ def test_utf8_bom_is_accepted(tmp_path):
     (UPSTREAM + MODEL.replace("input_price = 0.3", "input_price = Infinity"), "[model:m] input_price：不是數字"),
     (UPSTREAM + MODEL.replace("input_price = 0.3", "input_price = abc"), "[model:m] input_price：不是數字"),
     (UPSTREAM + MODEL.replace("output_price = 1.2\n", ""), "[model:m] output_price：必填"),
+    # 快取價比輸入價高的話，預扣（按輸入價估）就不再是上限
+    (VALID + "cached_input_price = 0.31\n", "[model:m] cached_input_price：不可高於 input_price"),
+    (VALID + "cached_input_price = -0.1\n", "[model:m] cached_input_price：不可小於 0"),
     # 其他型別
     ("[site]\nmax_keys_per_user = many\n" + VALID, "[site] max_keys_per_user：必須是整數"),
     (VALID + "[token:USDT]\ncontract = 0x123\n", "[token:USDT] contract：合約地址格式錯誤"),
 ], ids=["typo-key", "typo-section", "default-section", "duplicate-key", "unknown-upstream", "bad-port",
         "bad-scheme", "zero-output", "negative-output", "negative-image", "bad-field-choice", "negative-price",
-        "too-precise-price", "infinite-price", "text-price", "missing-price", "text-int", "bad-contract"])
+        "too-precise-price", "infinite-price", "text-price", "missing-price", "cached-above-input",
+        "negative-cached", "text-int", "bad-contract"])
 def test_mistakes_are_reported_with_location(tmp_path, text, expected):
     with pytest.raises(ConfigError) as exc:
         load_settings(write(tmp_path, text))

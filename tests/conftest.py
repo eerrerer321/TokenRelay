@@ -62,13 +62,16 @@ class Harness:
         """讓掃鏈程式跑第一輪（建立掃描進度），之後才能建立儲值訂單。"""
         await self.app.state.watcher.poll_once()
 
-    async def add_model(self, name: str = "gpt-test", *, input_price: int = 1_000_000, output_price: int = 2_000_000,
-                        max_output_tokens: int = 100, max_tokens_field: str = "max_tokens",
-                        image_tokens: int = 0) -> None:
-        """等同在 config.ini 加一個 [model:名稱] 區段（上游是假上游 fake）。"""
+    async def add_model(self, name: str = "gpt-test", *, input_price: int | None = 1_000_000,
+                        output_price: int | None = 2_000_000, max_output_tokens: int = 100,
+                        max_tokens_field: str = "max_tokens", image_tokens: int = 0,
+                        cached_input_price: int | None = None, kind: str = "chat", image_price: int | None = None,
+                        upstream: str = "fake") -> None:
+        """等同在 config.ini 加一個 [model:名稱] 區段（上游預設是假上游 fake）。"""
         self.app.state.settings.models[name] = ModelConfig(
-            name=name, upstream="fake", upstream_model=f"up-{name}",
-            input_price_micro=input_price, output_price_micro=output_price,
+            name=name, upstream=upstream, upstream_model=f"up-{name}", kind=kind,
+            input_price_micro=input_price, output_price_micro=output_price, image_price_micro=image_price,
+            cached_input_price_micro=cached_input_price,
             max_output_tokens=max_output_tokens, max_tokens_field=max_tokens_field, image_tokens=image_tokens,
         )
 
@@ -111,7 +114,12 @@ async def h(tmp_path):
         chain_start_block=1,
         receive_address=RECEIVE,
         tokens={"USDT": TokenConfig(symbol="USDT", contract=USDT), "USDC": TokenConfig(symbol="USDC", contract=USDC)},
-        upstreams={"fake": UpstreamConfig(name="fake", base_url="http://upstream/v1", api_key=UPSTREAM_SECRET)},
+        upstreams={
+            # 假上游三種格式都支援：OpenAI chat、OpenAI responses、Anthropic messages
+            "fake": UpstreamConfig(name="fake", base_url="http://upstream/v1", api_key=UPSTREAM_SECRET,
+                                   responses=True, anthropic_base_url="http://upstream/anthropic"),
+            "plain": UpstreamConfig(name="plain", base_url="http://upstream/v1", api_key=UPSTREAM_SECRET),
+        },
     )
     app = create_app(
         settings,

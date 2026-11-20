@@ -11,28 +11,38 @@ from app.models import ApiKey, Ledger, UsageLog, User
 
 MICRO = 1_000_000
 INPUT_MARGIN_TOKENS = 64  # 上游套對話模板時額外加的少量 token
+# 請求帶工具時，上游會自動加一段看不到的「工具使用說明」並算進輸入（Anthropic 約 300～500 tokens），
+# 請求的 byte 數裡沒有它，所以預扣另外加這麼多
+TOOLS_MARGIN_TOKENS = 1024
 
 
-def calc_cost(prompt_tokens: int, completion_tokens: int, input_price_micro: int, output_price_micro: int) -> int:
+def calc_cost(prompt_tokens: int, completion_tokens: int, input_price_micro: int, output_price_micro: int, *,
+              cached_tokens: int = 0, cached_input_price_micro: int | None = None) -> int:
     """價格單位是「每 1M tokens 幾 micro-USD」。
 
+    cached_tokens 是 prompt_tokens 裡「快取命中」的部分，改用快取價；沒設定快取價就照輸入價收。
     無條件進位：如果用四捨五入或捨去，「每次只送 1 個 token」的請求會被算成 0 元，可以無限白嫖。
     """
-    total = prompt_tokens * input_price_micro + completion_tokens * output_price_micro
+    cached = min(cached_tokens, prompt_tokens)
+    cached_price = input_price_micro if cached_input_price_micro is None else cached_input_price_micro
+    total = ((prompt_tokens - cached) * input_price_micro + cached * cached_price
+             + completion_tokens * output_price_micro)
     return -(-total // MICRO)
 
 
 def estimate_hold(
     body_bytes: int, image_count: int, image_tokens: int, output_cap: int, input_price_micro: int,
-    output_price_micro: int,
+    output_price_micro: int, *, has_tools: bool = False,
 ) -> int:
     """這個請求「最貴可能花多少」。
 
     輸入：主流 tokenizer 一個 token 至少 1 byte，所以請求的 byte 數一定 ≥ 文字 token 數。
     圖片：請求裡只佔一個網址，上游卻按圖片大小收費，所以每張再加上該模型設定的最壞 token 數。
+    工具：上游加的工具使用說明不在請求裡，帶工具時再加 TOOLS_MARGIN_TOKENS。
     輸出：上限欄位已經被站方改寫成模型上限以內，上游最多只會生成這麼多。
     """
-    input_upper = body_bytes + INPUT_MARGIN_TOKENS + image_count * image_tokens
+    input_upper = (body_bytes + INPUT_MARGIN_TOKENS + image_count * image_tokens
+                   + (TOOLS_MARGIN_TOKENS if has_tools else 0))
     return calc_cost(input_upper, output_cap, input_price_micro, output_price_micro)
 
 
@@ -146,6 +156,20 @@ async def settle(
         if refund:
             await change_balance(session, user_id, refund, "settle", f"usage:{usage_id}")
     return True
+
+
+async def settle_abandoned_holds(sm: async_sessionmaker) -> int:
+    """伺服器啟動時呼叫：上次當機或關機時還沒結算的預扣，照「拿不到用量」的規則收全額預扣，回傳處理了幾筆。
+
+    只適用單一程序：啟動當下不會有其他程序的請求還在進行中（同攻防清單 C）。
+    """
+    async with sm() as session:
+        rows = (await session.execute(
+            select(UsageLog.id, UsageLog.hold_micro).where(UsageLog.status == "pending")
+        )).all()
+    for usage_id, hold in rows:
+        await settle(sm, usage_id, cost=hold, status="abandoned")
+    return len(rows)
 
 
 class ConcurrencyLimiter:

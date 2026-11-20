@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI 模型轉發站</title>
+  <!-- 外部檔案都鎖定版本並加上 integrity（檔案雜湊）：CDN 上的檔案被竄改時，瀏覽器會拒絕執行 -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
+        integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH" crossorigin="anonymous">
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+
+<nav class="navbar navbar-expand-md bg-body-tertiary border-bottom d-none" id="navbar">
+  <div class="container">
+    <a class="navbar-brand fw-semibold" href="#overview">AI 模型轉發站</a>
+    <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#nav-links"
+            aria-controls="nav-links" aria-expanded="false" aria-label="切換選單">
+      <span class="navbar-toggler-icon"></span>
+    </button>
+    <div class="collapse navbar-collapse" id="nav-links">
+      <ul class="navbar-nav me-auto">
+        <li class="nav-item"><a class="nav-link" href="#overview">總覽</a></li>
+        <li class="nav-item"><a class="nav-link" href="#deposit">儲值</a></li>
+        <li class="nav-item"><a class="nav-link" href="#keys">API Key</a></li>
+        <li class="nav-item"><a class="nav-link" href="#models">模型與價格</a></li>
+        <li class="nav-item"><a class="nav-link" href="#usage">用量紀錄</a></li>
+        <li class="nav-item"><a class="nav-link" href="#ledger">帳本</a></li>
+      </ul>
+      <div class="d-flex align-items-center gap-3">
+        <span class="small text-body-secondary" id="nav-email"></span>
+        <span class="badge text-bg-success fs-6" id="nav-balance"></span>
+        <button class="btn btn-outline-secondary btn-sm" type="button" id="logout-btn">登出</button>
+      </div>
+    </div>
+  </div>
+</nav>
+
+<main class="container py-4">
+  <div id="alerts"></div>
+
+  <!-- ============================================================ 登入／註冊 -->
+  <section data-view="auth" class="d-none">
+    <div class="row justify-content-center">
+      <div class="col-sm-10 col-md-7 col-lg-5">
+        <h1 class="h3 text-center mb-4">AI 模型轉發站</h1>
+        <div class="card shadow-sm">
+          <div class="card-header">
+            <ul class="nav nav-tabs card-header-tabs" role="tablist">
+              <li class="nav-item" role="presentation">
+                <button class="nav-link active" data-bs-toggle="tab" data-bs-target="#tab-login" type="button"
+                        role="tab">登入</button>
+              </li>
+              <li class="nav-item" role="presentation">
+                <button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-register" type="button"
+                        role="tab">註冊</button>
+              </li>
+            </ul>
+          </div>
+          <div class="card-body tab-content">
+            <form class="tab-pane fade show active" id="tab-login" role="tabpanel">
+              <div class="mb-3">
+                <label class="form-label" for="login-email">Email</label>
+                <input class="form-control" id="login-email" name="email" type="email" autocomplete="username"
+                       required maxlength="254">
+              </div>
+              <div class="mb-3">
+                <label class="form-label" for="login-password">密碼</label>
+                <input class="form-control" id="login-password" name="password" type="password"
+                       autocomplete="current-password" required maxlength="128">
+              </div>
+              <button class="btn btn-primary w-100" type="submit">登入</button>
+              <div class="form-text text-center mt-2">忘記密碼？請私訊站長，取得重設密碼的連結</div>
+            </form>
+            <form class="tab-pane fade" id="tab-register" role="tabpanel">
+              <div class="mb-3">
+                <label class="form-label" for="reg-email">Email</label>
+                <input class="form-control" id="reg-email" name="email" type="email" autocomplete="username"
+                       required maxlength="254">
+              </div>
+              <div class="mb-3">
+                <label class="form-label" for="reg-password">密碼</label>
+                <input class="form-control" id="reg-password" name="password" type="password"
+                       autocomplete="new-password" required minlength="10" maxlength="128">
+                <div class="form-text">至少 10 個字元</div>
+              </div>
+              <div class="mb-3">
+                <label class="form-label" for="reg-invite">邀請碼</label>
+                <input class="form-control" id="reg-invite" name="invite_code" required maxlength="128">
+              </div>
+              <button class="btn btn-primary w-100" type="submit">註冊</button>
+            </form>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ 重設密碼（站長給的連結） -->
+  <section data-view="reset" class="d-none">
+    <div class="row justify-content-center">
+      <div class="col-sm-10 col-md-7 col-lg-5">
+        <h1 class="h3 text-center mb-4">設定新密碼</h1>
+        <div class="card shadow-sm">
+          <form class="card-body" id="reset-form">
+            <div class="mb-3">
+              <label class="form-label" for="reset-password">新密碼</label>
+              <input class="form-control" id="reset-password" name="password" type="password"
+                     autocomplete="new-password" required minlength="10" maxlength="128">
+              <div class="form-text">至少 10 個字元。設定完成後，所有裝置上的登入都會失效，要重新登入。</div>
+            </div>
+            <div class="mb-3">
+              <label class="form-label" for="reset-confirm">再輸入一次</label>
+              <input class="form-control" id="reset-confirm" name="confirm" type="password"
+                     autocomplete="new-password" required minlength="10" maxlength="128">
+            </div>
+            <button class="btn btn-primary w-100" type="submit">設定新密碼</button>
+          </form>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ 總覽 -->
+  <section data-view="overview" class="d-none">
+    <h1 class="h4 mb-3">總覽</h1>
+    <div class="row g-3">
+      <div class="col-md-4">
+        <div class="card h-100">
+          <div class="card-body">
+            <div class="text-body-secondary small">目前餘額（美元）</div>
+            <div class="display-6 fw-semibold" id="overview-balance">-</div>
+            <a class="btn btn-primary btn-sm mt-3" href="#deposit">去儲值</a>
+          </div>
+        </div>
+      </div>
+      <div class="col-md-8">
+        <div class="card h-100">
+          <div class="card-body">
+            <h2 class="h6">在 Cherry Studio 這類工具裡設定</h2>
+            <ol class="mb-0">
+              <li>新增一個「OpenAI 相容」的服務商</li>
+              <li class="mt-1">API 位址填：
+                <span class="d-inline-flex align-items-center gap-2">
+                  <code id="api-base"></code>
+                  <button class="btn btn-outline-secondary btn-sm py-0" type="button" data-copy-from="api-base">複製</button>
+                </span>
+                <div class="form-text">有些工具會自己在後面補 <code>/v1</code>，那就把結尾的 <code>/v1</code> 拿掉。</div>
+              </li>
+              <li class="mt-1">API Key 填你在 <a href="#keys">API Key</a> 頁建立的 <code>sk-</code> 開頭的 key</li>
+              <li class="mt-1">模型名稱從 <a href="#models">模型與價格</a> 頁挑</li>
+            </ol>
+          </div>
+        </div>
+      </div>
+    </div>
+    <h2 class="h6 mt-4">最近的請求</h2>
+    <div class="table-responsive">
+      <table class="table table-sm align-middle">
+        <thead><tr><th>時間</th><th>模型</th><th>狀態</th><th class="text-end">輸入 / 輸出 tokens</th><th class="text-end">費用（美元）</th></tr></thead>
+        <tbody id="overview-usage"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ============================================================ 儲值 -->
+  <section data-view="deposit" class="d-none">
+    <h1 class="h4 mb-3">儲值</h1>
+    <div class="alert alert-warning d-none" id="deposit-disabled">站長還沒開啟儲值功能。</div>
+    <div class="row g-4" id="deposit-main">
+      <div class="col-lg-5">
+        <div class="card">
+          <div class="card-body">
+            <h2 class="h6">建立儲值訂單</h2>
+            <form id="deposit-form">
+              <div class="mb-3">
+                <label class="form-label" for="deposit-token">幣種</label>
+                <select class="form-select" id="deposit-token" name="token" required></select>
+              </div>
+              <div class="mb-3">
+                <label class="form-label" for="deposit-amount">金額（整數美元）</label>
+                <input class="form-control" id="deposit-amount" name="amount_usd" type="number" step="1" required>
+                <div class="form-text" id="deposit-range"></div>
+              </div>
+              <button class="btn btn-primary w-100" type="submit">建立訂單</button>
+            </form>
+            <hr>
+            <ul class="small text-body-secondary mb-0 ps-3">
+              <li>系統會給你一個帶 4 位小數尾數的金額（例如 10.0037），用尾數辨認是誰付的款。</li>
+              <li>1 USDT ＝ 1 USDC ＝ 1 美元額度。</li>
+              <li>轉帳後約 1 分鐘內自動入帳，不需要回報。</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+      <div class="col-lg-7">
+        <div class="card border-primary d-none" id="order-card">
+          <div class="card-body">
+            <div class="d-flex justify-content-between align-items-start mb-3">
+              <h2 class="h6 mb-0">訂單 #<span id="order-id"></span></h2>
+              <span class="badge" id="order-status"></span>
+            </div>
+            <div class="row g-3">
+              <div class="col-sm-5 text-center">
+                <img id="order-qr" class="img-fluid border rounded p-2 bg-white" alt="收款地址 QR code">
+                <div class="small text-body-secondary mt-1">QR code 只含收款地址，金額要自己輸入</div>
+              </div>
+              <div class="col-sm-7">
+                <div class="small text-body-secondary">請轉「完全相同」的金額</div>
+                <div class="d-flex align-items-center gap-2 flex-wrap">
+                  <span class="fs-3 fw-bold font-monospace" id="order-amount"></span>
+                  <span class="fs-5" id="order-token"></span>
+                  <button class="btn btn-outline-secondary btn-sm" type="button" data-copy-from="order-amount">複製金額</button>
+                </div>
+                <div class="small text-body-secondary mt-3">收款地址</div>
+                <div class="d-flex align-items-center gap-2">
+                  <code class="text-break" id="order-address"></code>
+                  <button class="btn btn-outline-secondary btn-sm flex-shrink-0" type="button" data-copy-from="order-address">複製</button>
+                </div>
+                <div class="small text-body-secondary mt-3">網路</div>
+                <div><span class="badge text-bg-warning" id="order-chain"></span></div>
+                <div class="small text-body-secondary mt-3">代幣合約</div>
+                <code class="small text-break" id="order-contract"></code>
+                <div class="mt-3" id="order-countdown-wrap">剩餘時間：<span class="fw-semibold" id="order-countdown"></span></div>
+              </div>
+            </div>
+            <div class="alert alert-danger small mt-3 mb-0">
+              <strong>一定要確認：</strong>
+              只能用上面標示的網路轉帳，用錯網路（例如 Ethereum、TRON）錢會不見；
+              從交易所提領時，交易所會扣手續費，請確認「實際到帳」金額等於上面的數字，少一點點都對不上。
+            </div>
+            <div class="alert alert-success mt-3 mb-0 d-none" id="order-paid">已收到付款，餘額已更新。</div>
+          </div>
+        </div>
+        <div class="text-body-secondary small" id="order-empty">建立訂單後，付款資訊會顯示在這裡。</div>
+      </div>
+    </div>
+    <h2 class="h6 mt-4">儲值紀錄</h2>
+    <div class="table-responsive">
+      <table class="table table-sm align-middle">
+        <thead><tr><th>#</th><th>幣種</th><th class="text-end">應付金額</th><th>狀態</th><th>期限</th><th></th></tr></thead>
+        <tbody id="deposit-list"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ============================================================ API Key -->
+  <section data-view="keys" class="d-none">
+    <h1 class="h4 mb-3">API Key</h1>
+    <form class="row g-2 align-items-end mb-3" id="key-form">
+      <div class="col-sm-6 col-md-4">
+        <label class="form-label" for="key-name">名稱（自己辨認用）</label>
+        <input class="form-control" id="key-name" name="name" maxlength="64" placeholder="例如 cherry-studio" required>
+      </div>
+      <div class="col-auto"><button class="btn btn-primary" type="submit">建立新的 key</button></div>
+    </form>
+    <div class="table-responsive">
+      <table class="table table-sm align-middle">
+        <thead><tr><th>名稱</th><th>開頭</th><th>狀態</th><th>建立時間</th><th></th></tr></thead>
+        <tbody id="key-list"></tbody>
+      </table>
+    </div>
+    <p class="small text-body-secondary">key 外洩時，在這裡停用它再建一把新的。停用後無法恢復。</p>
+  </section>
+
+  <!-- ============================================================ 模型與價格 -->
+  <section data-view="models" class="d-none">
+    <h1 class="h4 mb-3">模型與價格</h1>
+    <div class="table-responsive">
+      <table class="table table-sm align-middle">
+        <thead><tr><th>模型名稱</th><th>類型</th><th class="text-end">輸入（美元 / 100 萬 tokens）</th><th class="text-end">快取命中的輸入</th><th class="text-end">輸出（美元 / 100 萬 tokens）</th><th class="text-end">單次輸出上限</th><th>圖片</th></tr></thead>
+        <tbody id="model-list"></tbody>
+      </table>
+    </div>
+    <p class="small text-body-secondary">
+      每次請求會先預扣「最壞情況」的費用，回應結束後按實際 token 數多退少補，所以餘額要比單次費用多一些才能發出請求。
+    </p>
+    <p class="small text-body-secondary">
+      「快取命中的輸入」：長對話或 agent 每次都會重送前面的內容，上游認出重複的部分時會回報「快取命中」，這部分改用較低的價格。
+      能不能命中由上游決定；上游沒回報就照一般輸入價。
+    </p>
+    <p class="small text-body-secondary">
+      「產生圖片」按張數收費（/v1/images/generations）；「文字轉語音」按輸入的字元數收費（/v1/audio/speech）；
+      「embeddings」只收輸入（/v1/embeddings）。
+    </p>
+  </section>
+
+  <!-- ============================================================ 用量紀錄 -->
+  <section data-view="usage" class="d-none">
+    <h1 class="h4 mb-3">用量紀錄 <span class="small text-body-secondary fw-normal">（最近 200 筆）</span></h1>
+    <div class="table-responsive">
+      <table class="table table-sm align-middle">
+        <thead><tr><th>時間</th><th>模型</th><th>串流</th><th>狀態</th><th class="text-end">輸入 tokens</th><th class="text-end">輸出 tokens</th><th class="text-end">預扣</th><th class="text-end">實扣</th></tr></thead>
+        <tbody id="usage-list"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ============================================================ 帳本 -->
+  <section data-view="ledger" class="d-none">
+    <h1 class="h4 mb-3">帳本 <span class="small text-body-secondary fw-normal">（每一筆餘額變動，最近 200 筆）</span></h1>
+    <div class="table-responsive">
+      <table class="table table-sm align-middle">
+        <thead><tr><th>時間</th><th>類型</th><th class="text-end">金額（美元）</th><th>參考</th></tr></thead>
+        <tbody id="ledger-list"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<!-- 新 key 只顯示一次 -->
+<div class="modal fade" id="new-key-modal" tabindex="-1" aria-labelledby="new-key-title" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h2 class="modal-title h5" id="new-key-title">新的 API key</h2>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="關閉"></button>
+      </div>
+      <div class="modal-body">
+        <div class="alert alert-warning small">這是唯一一次顯示完整的 key，關掉就看不到了。請現在複製保存，不要分享給別人。</div>
+        <div class="input-group">
+          <input class="form-control font-monospace" id="new-key-value" readonly>
+          <button class="btn btn-outline-primary" type="button" data-copy-from="new-key-value">複製</button>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-primary" data-bs-dismiss="modal">我已經保存好了</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"
+        integrity="sha384-YvpcrYf0tY3lHB60NNkmXc5s9fDVZLESaAA55NDzOxhy9GkcIdslK1eN7N6jIeHz" crossorigin="anonymous"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js"
+        integrity="sha512-ZDSPMa/JM1D+7kdg2x3BsruQ6T/JpJo3jWDWkCZsP+5yVyp1KfESqLI+7RqB5k24F7p2cV7i2YHh/890y6P6Sw==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+<script src="/app.js"></script>
+</body>
+</html>

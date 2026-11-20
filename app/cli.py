@@ -1,16 +1,18 @@
-"""站長用的命令列工具（刻意不做管理網頁：沒有管理 API，就沒有管理 API 可以被攻擊）。
+"""站長用的命令列工具。
 
-上游與模型價格寫在 config.ini，不用指令新增。
+上游與模型價格寫在 config.ini，可以直接編輯，或用只限本機開啟的後台網頁（/admin）改。
 用法：python -m app.cli <指令> --help
 """
 
 import argparse
 import asyncio
 import json
+from pathlib import Path
 
 import httpx
 from sqlalchemy import select
 
+from app.backup import backup_sqlite
 from app.billing import change_balance, format_usd, usd_to_micro
 from app.chain import ChainWatcher
 from app.config import ConfigError, get_settings
@@ -30,10 +32,22 @@ async def cmd_list_models(_args, settings, _sm):
     if not settings.models:
         print("config.ini 裡還沒有任何 [model:名稱] 區段")
     for model in sorted(settings.models.values(), key=lambda m: m.name):
-        print(f"{model.name:30} 上游={model.upstream}/{model.upstream_model}  "
-              f"輸入 ${format_usd(model.input_price_micro)}/1M  輸出 ${format_usd(model.output_price_micro)}/1M  "
-              f"輸出上限 {model.max_output_tokens}  "
-              f"圖片 {f'每張最多 {model.image_tokens} tokens' if model.image_tokens else '不接受'}")
+        head = f"{model.name:30} 上游={model.upstream}/{model.upstream_model}  "
+        if not model.enabled:
+            head += "（未開放）"
+        if model.kind == "embedding":
+            print(head + f"embeddings  輸入 ${format_usd(model.input_price_micro)}/1M tokens")
+        elif model.kind == "speech":
+            print(head + f"文字轉語音  ${format_usd(model.input_price_micro)}/1M 字元")
+        elif model.kind == "image":
+            print(head + f"產生圖片  每張 ${format_usd(model.image_price_micro)}")
+        else:
+            cached = model.cached_input_price_micro
+            print(head + f"輸入 ${format_usd(model.input_price_micro)}/1M  "
+                  f"快取輸入 {'不打折' if cached is None else f'${format_usd(cached)}/1M'}  "
+                  f"輸出 ${format_usd(model.output_price_micro)}/1M  "
+                  f"輸出上限 {model.max_output_tokens}  "
+                  f"圖片 {f'每張最多 {model.image_tokens} tokens' if model.image_tokens else '不接受'}")
 
 
 async def cmd_credit(args, _settings, sm):
@@ -95,7 +109,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("poll-chain", help="手動掃一次鏈（除錯用）")
     p.set_defaults(func=cmd_poll_chain)
+
+    p = sub.add_parser("backup", help="備份 SQLite 資料庫（伺服器運作中也可以跑）")
+    p.add_argument("--dir", default="backups", help="備份放哪個資料夾（預設 backups）")
+    p.add_argument("--keep", type=int, default=14, help="只留最新的幾份（預設 14）")
+    p.set_defaults(func=cmd_backup)
     return parser
+
+
+async def cmd_backup(args, settings, _sm):
+    try:
+        dest = backup_sqlite(settings.database_url, Path(args.dir), args.keep)
+    except ValueError as exc:
+        raise SystemExit(f"備份失敗：{exc}") from None
+    print(f"已備份到 {dest}")
 
 
 async def _run(args) -> None:

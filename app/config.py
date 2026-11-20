@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Literal
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, ValidationInfo, field_validator, model_validator
 
 from app.billing import usd_to_micro
 
@@ -47,10 +47,15 @@ class UpstreamConfig(BaseModel):
     name: str
     base_url: str  # 例：https://api.deepseek.com/v1
     api_key: str = ""  # 不需要 key 的本機上游可以留空
+    responses: bool = False  # 上游有 OpenAI 的 /responses（Codex CLI 用）才開
+    # 上游的 Anthropic 格式入口（Claude Code 用的 /v1/messages），例如 https://api.deepseek.com/anthropic；留空 = 不支援
+    anthropic_base_url: str = ""
 
-    @field_validator("base_url")
+    @field_validator("base_url", "anthropic_base_url")
     @classmethod
     def _check_url(cls, value: str) -> str:
+        if value == "":
+            return value  # anthropic_base_url 可以留空；base_url 留空會被「必填」擋下
         if not value.startswith(("http://", "https://")):
             raise ValueError("必須以 http:// 或 https:// 開頭")
         try:
@@ -67,22 +72,63 @@ class ModelConfig(BaseModel):
     name: str  # 使用者在工具裡選的模型名稱
     upstream: str  # 對應哪個 [upstream:名稱]
     upstream_model: str  # 上游實際的模型名稱
-    input_price_micro: int = Field(ge=0)  # 每 1M 輸入 token 幾 micro-USD
-    output_price_micro: int = Field(ge=0)  # 每 1M 輸出 token 幾 micro-USD
+    # chat：對話（chat/completions、responses、messages）；embedding：文字轉向量；image：產生圖片；speech：文字轉語音
+    kind: Literal["chat", "embedding", "image", "speech"] = "chat"
+    # 每 1M 輸入 token 幾 micro-USD（speech 是每 1M 個字元）。chat、embedding、speech 必填
+    input_price_micro: int | None = Field(default=None, ge=0)
+    output_price_micro: int | None = Field(default=None, ge=0)  # 每 1M 輸出 token 幾 micro-USD。chat 必填
+    image_price_micro: int | None = Field(default=None, ge=0)  # 每張圖幾 micro-USD。image 必填
+    # 上游回報「快取命中」的輸入 token 改用這個價格；None = 不打折，照輸入價收
+    cached_input_price_micro: int | None = Field(default=None, ge=0)
+    # 上游的進價：只給後台算利潤、按倍數訂價用，不影響收費
+    cost_input_price_micro: int | None = Field(default=None, ge=0)
+    cost_output_price_micro: int | None = Field(default=None, ge=0)
+    cost_cached_input_price_micro: int | None = Field(default=None, ge=0)
+    enabled: bool = True  # false = 暫時下架：使用者看不到、也呼叫不到
     max_output_tokens: int = Field(default=4096, gt=0)  # 必須是正數：負數會讓預扣變成「先送額度」
     max_tokens_field: Literal["max_tokens", "max_completion_tokens"] = "max_tokens"
     # 一張圖片在這個模型「最多」算幾個輸入 token；0 = 不接受圖片。各家算法差很多，要查上游文件填
     image_tokens: int = Field(default=0, ge=0)
 
+    @field_validator("cached_input_price_micro")
+    @classmethod
+    def _check_cached_price(cls, value: int | None, info: ValidationInfo) -> int | None:
+        # 預扣按一般輸入價估「最壞情況」；快取價比較貴的話，預扣就不再是上限
+        input_price = info.data.get("input_price_micro")
+        if value is not None and input_price is not None and value > input_price:
+            raise ValueError("不可高於 input_price")
+        return value
+
+    @model_validator(mode="after")
+    def _check_required_prices(self) -> "ModelConfig":
+        required = {"chat": ("input_price", "output_price"), "embedding": ("input_price",),
+                    "speech": ("input_price",), "image": ("image_price",)}[self.kind]
+        for key in required:
+            if getattr(self, f"{key}_micro") is None:
+                # 少填價格就等於免費：一定要擋下來
+                raise ValueError(f"{key}：必填" + ("" if self.kind == "chat" else f"（kind = {self.kind}）"))
+        return self
+
 
 class Settings(BaseModel):
     database_url: str = "sqlite+aiosqlite:///./dev.db"
     invite_code: str = ""  # 註冊用邀請碼；留空 = 關閉註冊
+    public_url: str = ""  # 網站對外的網址，例如 https://relay.example.com（後台產生重設密碼連結用）
     session_ttl_hours: int = 24 * 7
     max_body_bytes: int = 1_000_000  # 單一請求內容上限，也間接限制了預扣金額
     max_concurrent_per_user: int = 4
     max_keys_per_user: int = 20
     upstream_timeout_seconds: float = 300
+    # 同一個 email 或 IP，在 login_lock_minutes 分鐘內登入（或註冊）失敗幾次就暫停嘗試
+    login_max_failures: int = Field(default=5, gt=0)
+    login_lock_minutes: int = Field(default=15, gt=0)
+
+    # ---- 正式啟動（python -m app.serve）----
+    server_host: str = "0.0.0.0"  # 對外 HTTPS 綁在哪個網路介面；0.0.0.0 = 所有
+    server_https_port: int = Field(default=443, ge=0, le=65535)  # 0 = 不開對外入口
+    server_ssl_certfile: str = ""  # win-acme 產生的 xxx-chain.pem（憑證 + 中繼憑證）
+    server_ssl_keyfile: str = ""  # win-acme 產生的 xxx-key.pem（私鑰，不要外流）
+    server_local_port: int = Field(default=8000, gt=0, le=65535)  # 本機後台入口，只綁 127.0.0.1
 
     # ---- 鏈上儲值（方案 B：單一收款地址 + 金額尾數）----
     chain_name: str = "bsc-testnet"
@@ -118,6 +164,10 @@ class Settings(BaseModel):
     def token_configs(self) -> dict[str, TokenConfig]:
         return self.tokens
 
+    def open_models(self) -> dict[str, ModelConfig]:
+        """開放給使用者的模型（enabled = true）。"""
+        return {name: m for name, m in self.models.items() if m.enabled}
+
 
 # ---------------------------------------------------------------- 讀取 config.ini
 
@@ -126,11 +176,21 @@ _SECTION_FIELDS = {
     "site": {
         "database_url": "database_url",
         "invite_code": "invite_code",
+        "public_url": "public_url",
         "session_ttl_hours": "session_ttl_hours",
         "max_body_bytes": "max_body_bytes",
         "max_concurrent_per_user": "max_concurrent_per_user",
         "max_keys_per_user": "max_keys_per_user",
         "upstream_timeout_seconds": "upstream_timeout_seconds",
+        "login_max_failures": "login_max_failures",
+        "login_lock_minutes": "login_lock_minutes",
+    },
+    "server": {
+        "host": "server_host",
+        "https_port": "server_https_port",
+        "ssl_certfile": "server_ssl_certfile",
+        "ssl_keyfile": "server_ssl_keyfile",
+        "local_port": "server_local_port",
     },
     "chain": {
         "name": "chain_name",
@@ -151,10 +211,12 @@ _SECTION_FIELDS = {
 }
 _FIELD_TO_KEY = {field: (section, key) for section, keys in _SECTION_FIELDS.items() for key, field in keys.items()}
 _TOKEN_KEYS = {"contract", "decimals"}
-_UPSTREAM_KEYS = {"base_url", "api_key"}
-_MODEL_KEYS = {"upstream", "upstream_model", "input_price", "output_price", "max_output_tokens",
-               "max_tokens_field", "image_tokens"}
-_MODEL_KEY_NAMES = {"input_price_micro": "input_price", "output_price_micro": "output_price"}
+_UPSTREAM_KEYS = {"base_url", "api_key", "responses", "anthropic_base_url"}
+_PRICE_KEYS = ("input_price", "output_price", "cached_input_price", "image_price",
+               "cost_input_price", "cost_output_price", "cost_cached_input_price")
+_MODEL_KEYS = {"upstream", "upstream_model", *_PRICE_KEYS, "max_output_tokens", "max_tokens_field", "image_tokens",
+               "enabled", "kind"}
+_MODEL_KEY_NAMES = {f"{key}_micro": key for key in _PRICE_KEYS}
 
 
 def _error_text(error: dict) -> str:
@@ -174,6 +236,8 @@ def _error_text(error: dict) -> str:
         return f"不可小於 {ctx['ge']}"
     if kind == "less_than_equal":
         return f"不可大於 {ctx['le']}"
+    if kind == "bool_parsing":
+        return "只能是 true 或 false"
     if kind == "literal_error":
         return f"只能是 {ctx['expected']}"
     return error["msg"]
@@ -197,7 +261,8 @@ def _build(cls, section: str, source: str, key_names: dict | None = None, **valu
         error = exc.errors()[0]
         field = str(error["loc"][0]) if error["loc"] else ""
         key = (key_names or {}).get(field, field)
-        raise ConfigError(f"{source} [{section}] {key}：{_error_text(error)}") from None
+        where = f"{key}：" if key else ""  # 整體檢查（例如必填價格）的錯誤訊息自己會帶名稱
+        raise ConfigError(f"{source} [{section}] {where}{_error_text(error)}") from None
 
 
 def parse_config(parser: configparser.ConfigParser, source: str = "config.ini") -> Settings:
@@ -221,7 +286,7 @@ def parse_config(parser: configparser.ConfigParser, source: str = "config.ini") 
             upstreams[name] = _build(UpstreamConfig, section, source, name=name, **values)
         elif colon and name and kind == "model":
             values = _read_section(parser, section, _MODEL_KEYS, source)
-            for key in ("input_price", "output_price"):
+            for key in _PRICE_KEYS:
                 if key in values:
                     try:
                         values[f"{key}_micro"] = usd_to_micro(values.pop(key))

@@ -118,7 +118,7 @@ env_key = "RELAY_API_KEY"
 wire_api = "responses"
 ```
 
-key 放在環境變數 `RELAY_API_KEY`。Codex 的 web search 這類由上游代執行的工具會被拒絕；`store` 一律被改成 false，`previous_response_id` 不支援（Codex 預設就不用它）；`prompt_cache_retention` 會被拿掉。新版 Codex 可能改用 `shell`、`apply_patch` 這類內建工具（還沒有官方文件寫清楚格式，所以還沒開放）：遇到「不支援的工具類型」錯誤時，錯誤訊息會寫出是哪一種。
+key 放在環境變數 `RELAY_API_KEY`。Codex 的 web search 這類由上游代執行的工具會被拒絕；`store` 一律被改成 false，`previous_response_id` 不支援（Codex 預設就不用它）；`prompt_cache_retention` 會被拿掉。新版 Codex 的 `shell` 工具有開放，但只限 `environment` 是 `{"type": "local"}`（指令在使用者電腦上跑）；在上游容器裡跑的 `container_auto`／`container_reference` 會另外計費，一律拒絕。`apply_patch` 這類其他內建工具還沒開放：遇到「不支援的工具類型」錯誤時，錯誤訊息會寫出是哪一種。
 
 ## 改用 PostgreSQL
 

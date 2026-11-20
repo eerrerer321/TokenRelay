@@ -150,12 +150,41 @@ async def test_responses_rejects_risky_features(h):
         {"include": [["reasoning.encrypted_content"]]},
         # 內容區塊也有欄位白名單：不能在其他類型的區塊偷塞 file_id 之類的欄位
         {"input": [{"role": "user", "content": [{"type": "input_text", "text": "hi", "file_id": "file-1"}]}]},
+        # shell 工具：在上游容器裡執行（另外計費）、沒寫 environment、environment 夾帶其他欄位都不行
+        {"tools": [{"type": "shell", "environment": {"type": "container_auto"}}]},
+        {"tools": [{"type": "shell", "environment": {"type": "container_reference", "container_id": "cntr_1"}}]},
+        {"tools": [{"type": "shell"}]},
+        {"tools": [{"type": "shell", "environment": {"type": "local", "network_policy": {}}}]},
+        {"input": [{"type": "shell_call_output", "call_id": "c1", "output": [{"stdout": "", "file_id": "file-1"}]}]},
+        {"input": [{"type": "shell_call_output", "call_id": "c1",
+                    "output": [{"stdout": "", "outcome": {"type": "exit", "exit_code": 0, "x": 1}}]}]},
+        {"input": [{"type": "shell_call_output", "call_id": "c1", "output": "not-a-list"}]},
     ]
     for extra in cases:
         r = await post(h, "/v1/responses", key, {"model": "gpt-test", "input": "hi", **extra})
         assert r.status_code == 400, (extra, r.text)
     assert h.upstream.requests == []
     assert await h.balance() == CREDIT
+
+
+async def test_responses_accepts_local_shell_tool_of_new_codex(h):
+    """新版 Codex 的 shell 工具（指令在使用者電腦上跑）：工具定義、上一輪的 shell_call 與執行結果都要能轉送。"""
+    key = await setup_user(h)
+    r = await post(h, "/v1/responses", key, {
+        "model": "gpt-test", "tools": [{"type": "shell", "environment": {"type": "local"}}],
+        "input": [
+            {"role": "user", "content": "ls"},
+            {"type": "shell_call", "call_id": "c1", "status": "completed",
+             "action": {"commands": ["ls"], "timeout_ms": 10000, "max_output_length": 4096}},
+            {"type": "shell_call_output", "call_id": "c1", "max_output_length": 4096,
+             "output": [{"stdout": "a.txt\n", "stderr": "", "outcome": {"type": "exit", "exit_code": 0}},
+                        {"stdout": "", "stderr": "", "outcome": {"type": "timeout"}}]},
+        ],
+    })
+    assert r.status_code == 200, r.text
+    sent = h.upstream.requests[-1]["body"]
+    assert sent["tools"] == [{"type": "shell", "environment": {"type": "local"}}]
+    assert sent["input"][2]["output"][0]["stdout"] == "a.txt\n"
 
 
 async def test_responses_strips_fields_tools_send_by_default(h):

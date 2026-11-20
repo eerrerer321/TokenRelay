@@ -120,11 +120,18 @@ RESPONSE_TOOL_FIELDS = {
     "function": frozenset({"type", "name", "description", "parameters", "strict"}),
     "custom": frozenset({"type", "name", "description", "format"}),
     "local_shell": frozenset({"type"}),
+    # 新版 Codex 用的 shell 工具：只收 environment = {"type": "local"}（指令在使用者電腦上跑）。
+    # container_auto／container_reference 是在上游的容器裡跑，另外計費，一律不開
+    "shell": frozenset({"type", "environment"}),
 }
+SHELL_LOCAL_ENVIRONMENT = {"type": "local"}
 RESPONSE_ITEM_TYPES = frozenset({
     "message", "function_call", "function_call_output", "reasoning", "custom_tool_call",
-    "custom_tool_call_output", "local_shell_call", "local_shell_call_output",
+    "custom_tool_call_output", "local_shell_call", "local_shell_call_output", "shell_call", "shell_call_output",
 })
+# shell_call_output 的 output 是指令執行結果的陣列（不是內容區塊），各自檢查欄位
+SHELL_OUTPUT_FIELDS = frozenset({"stdout", "stderr", "outcome"})
+SHELL_OUTCOME_FIELDS = frozenset({"type", "exit_code"})
 # 內容區塊的類型 → 可以有的欄位。input_file（PDF 等）的 token 數無法事先估計；
 # file_id 指的是上游帳號裡的檔案，那是站方共用的帳號，可能是別人上傳的，所以 input_image 也不收 file_id
 RESPONSE_CONTENT_FIELDS = {
@@ -154,9 +161,11 @@ def check_response_input(items) -> int:
         kind = item.get("type", "message")
         if not isinstance(kind, str) or kind not in RESPONSE_ITEM_TYPES:  # type 是陣列時不能拿來查表
             raise OpenAIError(400, f"不支援的 input 類型：{str(kind)[:40]}", "unsupported_content")
+        if kind == "shell_call_output":
+            check_shell_output(item.get("output"))
         # 不只訊息的 content：工具結果（function_call_output 等）的 output 也可以是內容陣列，可以夾帶圖片或檔案
-        parts = [part for field in ("content", "output", "summary")
-                 if isinstance(item.get(field), list) for part in item[field]]
+        fields = ("content", "summary") if kind == "shell_call_output" else ("content", "output", "summary")
+        parts = [part for field in fields if isinstance(item.get(field), list) for part in item[field]]
         for part in parts:
             part_type = part.get("type") if isinstance(part, dict) else None
             allowed = RESPONSE_CONTENT_FIELDS.get(part_type) if isinstance(part_type, str) else None
@@ -168,6 +177,17 @@ def check_response_input(items) -> int:
                     raise OpenAIError(400, "input_image 只支援 image_url", "unsupported_content")
                 images += 1
     return images
+
+
+def check_shell_output(output) -> None:
+    """shell_call_output 的 output：[{stdout, stderr, outcome: {type, exit_code}}]，只放行這幾個欄位。"""
+    if not isinstance(output, list):
+        raise OpenAIError(400, "shell_call_output 的 output 必須是陣列", "invalid_parameter")
+    for entry in output:
+        if not isinstance(entry, dict) or not isinstance(entry.get("outcome", {}), dict):
+            raise OpenAIError(400, "shell_call_output 格式錯誤", "invalid_parameter")
+        reject_unknown_fields(entry, SHELL_OUTPUT_FIELDS, "shell_call_output 裡")
+        reject_unknown_fields(entry.get("outcome", {}), SHELL_OUTCOME_FIELDS, "shell_call_output.outcome 裡")
 
 
 def check_response_tools(tools) -> None:
@@ -182,6 +202,9 @@ def check_response_tools(tools) -> None:
             raise OpenAIError(400, f"不支援的工具類型：{str(kind)[:40]}（由上游代執行的工具會另外計費）",
                               "unsupported_parameter")
         reject_unknown_fields(tool, allowed, "tools 裡")
+        if kind == "shell" and tool.get("environment") != SHELL_LOCAL_ENVIRONMENT:
+            raise OpenAIError(400, 'shell 工具只支援 environment = {"type": "local"}（在上游容器裡執行會另外計費）',
+                              "unsupported_parameter")
 
 
 def responses_usage_from(usage) -> Usage | None:
